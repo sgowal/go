@@ -3,6 +3,8 @@ import cv2
 import threading
 import time
 
+import rw_lock
+
 
 class VideoStream(object):
   def __init__(self, camera_index=0):
@@ -14,7 +16,7 @@ class VideoStream(object):
     assert args.image is None or args.movie is None, 'Cannot specify both --movie and --image'
 
     self._static_images = None
-    self._static_images_lock = threading.Lock()
+    self._static_images_lock = rw_lock.RWLock()
     self._static_image_index = 0
     self._movie_file = None
     if args.image is None and args.movie is None:
@@ -31,10 +33,10 @@ class VideoStream(object):
     assert self._frame is not None, 'Unable to open movie, camera feed or image'
 
     # Locks.
-    self._frame_lock = threading.Lock()
-    self._already_read_lock = threading.Lock()
+    self._frame_lock = rw_lock.RWLock()
+    self._already_read_lock = rw_lock.RWLock()
     self._already_read = False
-    self._status_lock = threading.Lock()
+    self._status_lock = rw_lock.RWLock()
     self._stopped = False
     self._paused = False
 
@@ -44,15 +46,15 @@ class VideoStream(object):
 
   def _Update(self):
     while True:
-      with self._status_lock:
+      with self._status_lock(rw_lock.READ_LOCKED):
         if self._stopped:
           return
         if self._paused:
           time.sleep(0.001)
           continue
-      with self._frame_lock:
+      with self._frame_lock(rw_lock.WRITE_LOCKED):
         if self._static_images is not None:
-          with self._static_images_lock:
+          with self._static_images_lock(rw_lock.READ_LOCKED):
             self._frame = self._static_images[self._static_image_index]
         else:
           _, self._frame = self._stream.read()
@@ -61,35 +63,36 @@ class VideoStream(object):
             # End of movie. Loop.
             self._stream = cv2.VideoCapture(self._movie_file)
             _, self._frame = self._stream.read()
-          with self._already_read_lock:
+          with self._already_read_lock(rw_lock.WRITE_LOCKED):
             self._already_read = False
       if self._movie_file:
         time.sleep(1. / 25.)
       time.sleep(0.001)
 
   def Read(self):
-    with self._frame_lock:
-      with self._already_read_lock:
+    with self._frame_lock(rw_lock.READ_LOCKED):
+      with self._already_read_lock(rw_lock.WRITE_LOCKED):
         ret = self._already_read
         self._already_read = True
       return self._frame.copy(), ret
 
   def Stop(self):
-    with self._status_lock:
+    with self._status_lock(rw_lock.WRITE_LOCKED):
       self._stopped = True
 
   def Pause(self):
-    with self._status_lock:
+    with self._status_lock(rw_lock.WRITE_LOCKED):
       self._paused = True
 
   def Continue(self):
-    with self._status_lock:
+    with self._status_lock(rw_lock.WRITE_LOCKED):
       self._paused = False
 
   def Next(self):
     if not self._static_images:
       return
-    with self._static_images_lock:
+    with self._static_images_lock(rw_lock.WRITE_LOCKED):
       self._static_image_index = (self._static_image_index + 1) % len(self._static_images)
-      with self._already_read_lock:
+      self._frame = self._static_images[self._static_image_index]
+      with self._already_read_lock(rw_lock.WRITE_LOCKED):
         self._already_read = False

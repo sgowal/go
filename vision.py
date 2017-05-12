@@ -29,8 +29,8 @@ ALL_UNPROJECTED_CALIBRATION_STEPS = [
 # Fixed parameters.
 _VOTE_SIZE = 200
 _VOTE_MARGIN = 5
-_SQUARE_SIZE = 25
-_MARGIN = 13
+SQUARE_SIZE = 25
+MARGIN = 13
 
 
 class Vision(object):
@@ -65,10 +65,10 @@ class Vision(object):
     with self._parameters_lock(rw_lock.WRITE_LOCKED):
       self._parameters[param_name] = param_value
 
-  def _StoreCalibrationResult(self, pipeline, boardsize):
+  def _StoreCalibrationResult(self, pipeline, boardsize=0):
     with self._calibration_result_lock(rw_lock.WRITE_LOCKED):
       # Only store a new calibration image if there is one.
-      if pipeline[CALIBRATION_FINAL]:
+      if pipeline[CALIBRATION_FINAL] is not None:
         self._calibration_image = pipeline[CALIBRATION_FINAL]
         self._boardsize = boardsize
       if self._debug:
@@ -80,17 +80,15 @@ class Vision(object):
     assert self._debug
     with self._calibration_result_lock(rw_lock.READ_LOCKED):
       with self._debug_pipeline_lock(rw_lock.READ_LOCKED):
-        return self._calibration_image.copy(), self._boardsize, self._debug_pipeline[debug_step].copy()
+        return (self._calibration_image.copy() if self._calibration_image is not None else None,
+                self._boardsize,
+                self._debug_pipeline[debug_step].copy() if self._debug_pipeline[debug_step] is not None else None)
 
   def Calibrate(self, input_image):
     """Finds an almost-empty Go board in an image."""
     # Keep local parameter copy.
     with self._parameters_lock(rw_lock.READ_LOCKED):
       params = copy.deepcopy(self._parameters)
-
-    # Reset parameters.
-    with self._boardsize_lock(rw_lock.WRITE_LOCKED):
-      self._boardsize = None
 
     # Keep track of all images. In debug mode, these images are
     # then copied atomically. Otherwise they are discarded.
@@ -127,7 +125,7 @@ class Vision(object):
           best_contour = contour
           max_area = area
     # Fit a square to the best contour.
-    if best_contour:
+    if best_contour is not None:
       best_contour = util.SimplifyContour(best_contour, approximation_eps=params['approx'])
     # For display only.
     if self._debug:
@@ -162,11 +160,11 @@ class Vision(object):
       self._StoreCalibrationResult(pipeline)
       return False
     # Set boardsize.
-    boardsize_pixel = _SQUARE_SIZE * (best_size - 1)
+    boardsize_pixel = SQUARE_SIZE * (best_size - 1)
     # Reproject to the right size.
-    image_pixel = boardsize_pixel + 2 * _MARGIN
+    image_pixel = boardsize_pixel + 2 * MARGIN
     destination_points = _OrderPoints(np.float32([[0, 0], [0, boardsize_pixel], [boardsize_pixel, boardsize_pixel],
-                                                  [boardsize_pixel, 0]])) + _MARGIN
+                                                  [boardsize_pixel, 0]])) + MARGIN
     M = cv2.getPerspectiveTransform(original_points, destination_points)
     pipeline[CALIBRATION_FINAL] = cv2.warpPerspective(pipeline[CALIBRATION_GRAY], M, (image_pixel, image_pixel))
     # For display only.

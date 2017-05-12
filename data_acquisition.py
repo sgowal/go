@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import copy
 import cv2
 import msgpack
 import numpy as np
@@ -51,10 +50,12 @@ class MainWindow(QDialog):
 
     # Display images.
     self._display_step_lock = threading.Lock()
-    self._display_step = vision.CALIBRATION_ORIGNAL
+    self._display_step = vision.CALIBRATION_ORIGINAL
     self._display_image_lock = threading.Lock()
-    self._display_original_image = None
-    self._display_result_image = None
+    self._display_image_left = None
+    self._display_image_right = None
+    self._boardsize = None
+    self._processed_image = None
 
     # Vision processing.
     self._vision = vision.Vision(debug=True)
@@ -77,13 +78,13 @@ class MainWindow(QDialog):
     self._dataset = []
     self._groundtruth_lock = threading.Lock()
     self._groundtruth = np.zeros((_LARGEST_BOARDSIZE, _LARGEST_BOARDSIZE), dtype=np.int8)
-    self._button_size = int(_SQUARE_SIZE * 0.7)
+    self._button_size = int(vision.SQUARE_SIZE * 0.7)
     self._buttons = []
     for i in range(_LARGEST_BOARDSIZE):
       self._buttons.append([])
-      x = _MARGIN + i * _SQUARE_SIZE - self._button_size / 2
+      x = vision.MARGIN + i * vision.SQUARE_SIZE - self._button_size / 2
       for j in range(_LARGEST_BOARDSIZE):
-        y = _MARGIN + j * _SQUARE_SIZE - self._button_size / 2
+        y = vision.MARGIN + j * vision.SQUARE_SIZE - self._button_size / 2
         button = QPushButton('', self)
         button.move(x + _ORIGNAL_WIDTH, y)
         button.clicked.connect(self.GetToggleFunction(i, j))
@@ -100,6 +101,8 @@ class MainWindow(QDialog):
     # Processing thread.
     self._status_lock = threading.Lock()
     self._status = RUN
+    self._display_groundtruth_lock = threading.Lock()
+    self._display_groundtruth = False
     self._must_reprocess_lock = threading.Lock()
     self._must_reprocess = False
     self._flip_lock = threading.Lock()
@@ -108,8 +111,8 @@ class MainWindow(QDialog):
 
   def Detect(self, img, i, j):
     def CropLocalRegion(img, i, j):
-      x = _MARGIN + i * _SQUARE_SIZE - _CROP_SIZE / 2
-      y = _MARGIN + j * _SQUARE_SIZE - _CROP_SIZE / 2
+      x = vision.MARGIN + i * vision.SQUARE_SIZE - _CROP_SIZE / 2
+      y = vision.MARGIN + j * vision.SQUARE_SIZE - _CROP_SIZE / 2
       return img[y:y + _CROP_SIZE, x:x + _CROP_SIZE]
 
     def ComputeHoG(img):
@@ -178,43 +181,55 @@ class MainWindow(QDialog):
   def GetParameterReleasedFunction(self):
     def ReleasedParameter():
       with self._display_step_lock:
-        self._display_step = vision.CALIBRATION_ORIGNAL
+        self._display_step = vision.CALIBRATION_ORIGINAL
       with self._must_reprocess_lock:
         self._must_reprocess = True
     return ReleasedParameter
 
   def GetToggleFunction(self, i, j):
     def ToggleGroundtruth():
+      with self._display_image_lock:
+        boardsize = self._boardsize
       with self._groundtruth_lock:
         status = (self._groundtruth[i, j] + 1) % 3
         self._groundtruth[i, j] = status
-        color = ((255, 255, 255, 10),
-                 (0, 0, 0, 200),
-                 (255, 255, 255, 200))[status]
-        border = ((150, 150, 150),
-                  (255, 255, 255),
-                  (0, 0, 0))[status]
-        self.sender().setStyleSheet('background-color: rgba(%d, %d, %d, %d); '
-                                    'border: 1px solid rgb(%d, %d, %d); '
-                                    'border-radius: %dpx; ' % (color[0], color[1], color[2], color[3],
-                                                               border[0], border[1], border[2],
-                                                               self._button_size / 2))
+        UpdateButton(i, j, self.sender(), boardsize)
     return ToggleGroundtruth
 
-  def UpdateGroundtruth(self, i, j, status):
-    # Lock must be hold.
-    self._groundtruth[i, j] = status
+  # Hold locks!
+  def UpdateButton(self, i, j, button, boardsize):
+    if i >= self._boardsize or j >= self._boardsize:
+      button.hide()
+      return
+    status = self._groundtruth[i, j]
     color = ((255, 255, 255, 10),
              (0, 0, 0, 200),
              (255, 255, 255, 200))[status]
     border = ((150, 150, 150),
               (255, 255, 255),
               (0, 0, 0))[status]
-    self._buttons[i][j].setStyleSheet('background-color: rgba(%d, %d, %d, %d); '
-                                      'border: 1px solid rgb(%d, %d, %d); '
-                                      'border-radius: %dpx; ' % (color[0], color[1], color[2], color[3],
-                                                                 border[0], border[1], border[2],
-                                                                 self._button_size / 2))
+    button.setStyleSheet('background-color: rgba(%d, %d, %d, %d); '
+                         'border: 1px solid rgb(%d, %d, %d); '
+                         'border-radius: %dpx; ' % (color[0], color[1], color[2], color[3],
+                                                    border[0], border[1], border[2],
+                                                    self._button_size / 2))
+
+  # Must hold self._display_image_lock.
+  def UpdateGroundtruthButtons(self):
+    with self._display_groundtruth_lock:
+      if self._display_groundtruth:
+        with self._groundtruth_lock:
+          for i in range(_LARGEST_BOARDSIZE):
+            for j in range(_LARGEST_BOARDSIZE):
+              if i < self._boardsize and j < self._boardsize:
+                self.UpdateButton(i, j, self._buttons[i][j], self._boardsize)
+                self._buttons[i][j].show()
+              else:
+                self._buttons[i][j].hide()
+      else:
+        for i in range(_LARGEST_BOARDSIZE):
+          for j in range(_LARGEST_BOARDSIZE):
+            self._buttons[i][j].hide()
 
   def ConvertToQImage(self, img, width=None, height=None):
     img = util.ResizeImage(img, width, height)
@@ -239,147 +254,28 @@ class MainWindow(QDialog):
           with self._flip_lock:
             if self._flip:
               img = cv2.flip(img, 0)
-          ret = self._vision.Calibrate(img)
+          self._vision.Calibrate(img)
+          with self._display_step_lock:
+            right_image, boardsize, left_image = self._vision.GetCalibrationResult(self._display_step)
+          with self._display_image_lock:
+            self._display_image_left = self.ConvertToQImage(left_image, width=480) if left_image is not None else None
+            self._display_image_right = self.ConvertToQImage(right_image) if right_image is not None else None
+            self._processed_image = right_image
+            self._boardsize = boardsize
+          self.update()
       time.sleep(0.01)
       with self._status_lock:
         status = self._status
-
-  def ProcessImage(self, input_image):
-    # Keep local parameter copy.
-    with self._params_lock:
-      params = copy.deepcopy(self._params)
-
-    # Keep track of all images.
-    pipeline = {}
-
-    # Store.
-    with self._latest_input_image_lock:
-      self._latest_input_image = input_image
-    pipeline['original'] = self.ResizeImage(input_image, height=720)
-
-    # Blur + Grayscale.
-    pipeline['gray'] = cv2.cvtColor(pipeline['original'], cv2.COLOR_BGR2GRAY)
-    pipeline['blur'] = cv2.GaussianBlur(pipeline['gray'], (params['blur'], params['blur']), 0)
-
-    # The following sequence removes small lines.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params['close'], params['close']))
-    pipeline['close'] = cv2.morphologyEx(pipeline['blur'], cv2.MORPH_CLOSE, kernel)
-
-    # Small lines that were removed will pop.
-    div = np.float32(pipeline['blur']) / (pipeline['close'] + 1e-4)
-    pipeline['div'] = np.uint8(cv2.normalize(div, div, 0, 255, cv2.NORM_MINMAX))
-
-    # Threshold.
-    output = cv2.adaptiveThreshold(pipeline['div'], 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
-                                   params['th_block'], params['th_mean'])
-    pipeline['threshold'] = output.copy()
-
-    # Find the largest contour.
-    contours, _ = cv2.findContours(output, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    max_area = 0
-    all_contours = []
-    best_non_approx_contour = None
-    for contour in contours:
-      area = cv2.contourArea(contour)
-      if area > params['ctr_size'] * params['ctr_size']:
-        all_contours.append(contour)
-        if area > max_area:
-          best_non_approx_contour = contour
-          max_area = area
-    # Fit a square to the best contour.
-    best_contour = None
-    approximated_contour = None
-    if best_non_approx_contour is not None:
-      hull = cv2.convexHull(best_non_approx_contour)
-      perimeter = cv2.arcLength(hull, True)
-      approximated_contour = cv2.approxPolyDP(hull, params['approx'] * perimeter, True)
-      # Unfortunately, we still get 1 or 2 extra points sometimes.
-      num_points = approximated_contour.shape[0]
-      if 4 < num_points < 7:
-        keep_indices = []
-        for i in range(num_points):
-          prev = (i + num_points - 1) % num_points
-          next = (i + 1) % num_points
-          v_prev = np.float32(np.squeeze(approximated_contour[prev] - approximated_contour[i]))
-          v_next = np.float32(np.squeeze(approximated_contour[next] - approximated_contour[i]))
-          v_prev /= np.linalg.norm(v_prev)
-          v_next /= np.linalg.norm(v_next)
-          if v_prev.dot(v_next) > -0.95:
-            keep_indices.append(i)
-        approximated_contour = approximated_contour[np.array(keep_indices)]
-      if approximated_contour.shape[0] == 4:
-        best_contour = approximated_contour
-    # For display only.
-    img = pipeline['threshold'].copy()
-    pipeline['contour'] = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(pipeline['contour'], all_contours, -1, (255, 0, 0), 2)
-    if approximated_contour is not None:
-      cv2.drawContours(pipeline['contour'], [approximated_contour], -1, (0, 0, 255), 4)
-    # We found nothing.
-    if best_contour is None:
-      with self._display_image_lock:
-        with self._display_step_lock:
-          if self._display_step in ('vote',):
-            img = pipeline['original']
-          else:
-            img = pipeline[self._display_step]
-          self._display_original_image = self.ConvertToQImage(img, width=480)
-        # We do not update the result image.
-      self.update()
-      return
-
-    original_points = OrderPoints(np.squeeze(best_contour))
-
-    # We detect the board size by first projecting the detected and counting the number of lines.
-    destination_points = OrderPoints(np.float32([
-        [0, 0], [0, _VOTE_SIZE], [_VOTE_SIZE, _VOTE_SIZE],
-        [_VOTE_SIZE, 0]])) + _VOTE_MARGIN
-    M = cv2.getPerspectiveTransform(original_points, destination_points)
-    pipeline['vote'] = cv2.warpPerspective(
-        pipeline['threshold'], M, (_VOTE_SIZE + 2 * _VOTE_MARGIN,
-                                   _VOTE_SIZE + 2 * _VOTE_MARGIN))
-    best_vote, best_size = max((float(np.sum(pipeline['vote'] * m)) / float(np.sum(m)), s) for s, m in self._board_masks.iteritems())
-    # For display only.
-    pipeline['vote'] *= self._board_masks[best_size]
-    if best_vote < params['vote']:
-      with self._display_image_lock:
-        with self._display_step_lock:
-          self._display_original_image = self.ConvertToQImage(pipeline[self._display_step], width=480)
-        # We do not update the result image.
-      self.update()
-      return
-    with self._boardsize_lock:
-      self._boardsize = best_size
-      boardsize_pixel = _SQUARE_SIZE * (self._boardsize - 1)
-
-    # Reproject to the right size.
-    image_pixel = boardsize_pixel + 2 * _MARGIN
-    destination_points = OrderPoints(np.float32([[0, 0], [0, boardsize_pixel], [boardsize_pixel, boardsize_pixel],
-                                                 [boardsize_pixel, 0]])) + _MARGIN
-    M = cv2.getPerspectiveTransform(original_points, destination_points)
-    with self._processed_image_lock:
-      self._processed_image = cv2.warpPerspective(pipeline['gray'], M, (image_pixel, image_pixel))
-
-    # Display.
-    with self._display_step_lock:
-      img = pipeline[self._display_step].copy()
-      if len(img.shape) == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-      if self._display_step not in ('hough',):
-        cv2.drawContours(img, [best_contour], -1, (0, 255, 0), 2)
-    with self._display_image_lock:
-      self._display_original_image = self.ConvertToQImage(img, width=480)
-      self._display_result_image = self.ConvertToQImage(self._processed_image, width=image_pixel)
-    self.update()
 
   def paintEvent(self, QPaintEvent):
     painter = QPainter()
     painter.begin(self)
     with self._display_image_lock:
-      if self._display_original_image is not None:
-        painter.drawImage(0, 0, self._display_original_image)
-      if self._display_result_image is not None:
-        painter.drawImage(480, 0, self._display_result_image)
+      self.UpdateGroundtruthButtons()
+      if self._display_image_left is not None:
+        painter.drawImage(0, 0, self._display_image_left)
+      if self._display_image_right is not None:
+        painter.drawImage(480, 0, self._display_image_right)
     painter.end()
 
   def Quit(self):
@@ -411,38 +307,26 @@ class MainWindow(QDialog):
         else:
           self._capture.Continue()
         # Show groundtruth buttons.
-        with self._boardsize_lock:
-          if self._status == PAUSE and self._boardsize:
-            for i in range(self._boardsize):
-              for j in range(self._boardsize):
-                self._buttons[i][j].show()
-          else:
-            for i in range(_LARGEST_BOARDSIZE):
-              for j in range(_LARGEST_BOARDSIZE):
-                self._buttons[i][j].hide()
+        with self._display_image_lock:
+          show_groundtruth = self._status == PAUSE and self._boardsize
+          with self._display_groundtruth_lock:
+            self._display_groundtruth = show_groundtruth
+          self.UpdateGroundtruthButtons()
     elif 'd' == QKeyEvent.text():
-      with self._status_lock:
-        with self._boardsize_lock:
-          if self._status == PAUSE and self._boardsize:
-            print 'Detecting stones...'
-            with self._processed_image_lock:
+        with self._display_image_lock:
+          with self._display_groundtruth_lock:
+            if self._display_groundtruth:
+              print 'Detecting stones...'
               img = cv2.GaussianBlur(self._processed_image, (_BLUR, _BLUR), 0)
-            with self._groundtruth_lock:
-              for i in range(self._boardsize):
-                for j in range(self._boardsize):
-                  self.UpdateGroundtruth(i, j, self.Detect(img, i, j))
+              with self._groundtruth_lock:
+                for i in range(self._boardsize):
+                  for j in range(self._boardsize):
+                    self._groundtruth[i, j] = self.Detect(img, i, j)
             print 'Done'
+          self.UpdateGroundtruthButtons()
     elif 'n' == QKeyEvent.text():
       print 'Getting next static image...'
       self._capture.Next()
-      # We unpause if paused.
-      with self._status_lock:
-        if self._status == PAUSE:
-          self._status = RUN
-          # Hide groundtruth buttons.
-          for i in range(_LARGEST_BOARDSIZE):
-            for j in range(_LARGEST_BOARDSIZE):
-              self._buttons[i][j].hide()
       with self._must_reprocess_lock:
         self._must_reprocess = True
     elif 'p' == QKeyEvent.text():
@@ -459,7 +343,7 @@ class MainWindow(QDialog):
         if self._status != PAUSE:
           print 'Cannot save configuration when not paused.'
           return
-      with self._processed_image_lock:
+      with self._display_image_lock:
         if self._processed_image is None:
           print 'Board was not found. Cannot save.'
           return
