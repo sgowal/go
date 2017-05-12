@@ -26,6 +26,13 @@ ALL_UNPROJECTED_CALIBRATION_STEPS = [
     CALIBRATION_CONTOUR,
 ]
 
+# Tracking steps.
+TRACKING_ORIGINAL = 0
+TRACKING_GRAY = 1
+TRACKING_MATCHES = 2
+TRACKING_FINAL = 3
+ALL_TRACKING_STEPS = range(4)
+
 # Fixed parameters.
 _VOTE_SIZE = 200
 _VOTE_MARGIN = 5
@@ -51,15 +58,26 @@ class Vision(object):
     self._board_masks = {}
     for size in (9, 13, 19):
       self._board_masks[size] = _BuildGridImage(size)
+    # Calibration.
     self._calibration_result_lock = rw_lock.RWLock()
     self._boardsize = None
     self._calibration_image = None
+    # Tracking.
+    self._tracking_result_lock = rw_lock.RWLock()
+    self._tracking_image = None
+    self._sift = cv2.SIFT()
+    self._flann = cv2.FlannBasedMatcher({'algorithm': 0, 'trees': 5},
+                                        {'checks': 50})
     # Debugging mode keeps track of all intermediate processing steps.
     self._debug = debug
-    self._debug_pipeline_lock = rw_lock.RWLock()
-    self._debug_pipeline = {}
+    self._debug_calibration_pipeline_lock = rw_lock.RWLock()
+    self._debug_calibration_pipeline = {}
     for step in ALL_CALIBRATION_STEPS:
-      self._debug_pipeline[step] = None
+      self._debug_calibration_pipeline[step] = None
+    self._debug_tracking_pipeline_lock = rw_lock.RWLock()
+    self._debug_tracking_pipeline = {}
+    for step in ALL_TRACKING_STEPS:
+      self._debug_tracking_pipeline[step] = None
 
   def SetParameter(self, param_name, param_value):
     with self._parameters_lock(rw_lock.WRITE_LOCKED):
@@ -72,17 +90,17 @@ class Vision(object):
         self._calibration_image = pipeline[CALIBRATION_FINAL]
         self._boardsize = boardsize
       if self._debug:
-        with self._debug_pipeline_lock(rw_lock.WRITE_LOCKED):
-          self._debug_pipeline = pipeline
+        with self._debug_calibration_pipeline_lock(rw_lock.WRITE_LOCKED):
+          self._debug_calibration_pipeline = pipeline
 
   def GetCalibrationResult(self, debug_step=CALIBRATION_ORIGINAL):
     # This function should really only be used in debug mode.
     assert self._debug
     with self._calibration_result_lock(rw_lock.READ_LOCKED):
-      with self._debug_pipeline_lock(rw_lock.READ_LOCKED):
+      with self._debug_calibration_pipeline_lock(rw_lock.READ_LOCKED):
         return (self._calibration_image.copy() if self._calibration_image is not None else None,
                 self._boardsize,
-                self._debug_pipeline[debug_step].copy() if self._debug_pipeline[debug_step] is not None else None)
+                self._debug_calibration_pipeline[debug_step].copy() if self._debug_calibration_pipeline[debug_step] is not None else None)
 
   def Calibrate(self, input_image):
     """Finds an almost-empty Go board in an image."""
@@ -173,6 +191,35 @@ class Vision(object):
         cv2.drawContours(pipeline[step], [best_contour], -1, (0, 255, 0), 2)
     self._StoreCalibrationResult(pipeline, best_size)
     return True
+
+  def Track(self, input_image):
+    with self._calibration_result_lock(rw_lock.READ_LOCKED):
+      pattern = self._calibration_image.copy()
+
+    # Keep track of all images. In debug mode, these images are
+    # then copied atomically. Otherwise they are discarded.
+    pipeline = {}
+    pipeline[TRACKING_ORIGINAL] = util.ResizeImage(input_image, height=720)
+    pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
+
+    # Taken from http://docs.opencv.org/3.0-beta/doc/py_tutorials/py_feature2d/py_feature_homography/py_feature_homography.html#py-feature-homography.
+    kp1, des1 = self._sift.detectAndCompute(pattern, None)
+    kp2, des2 = self._sift.detectAndCompute(pipeline[TRACKING_ORIGINAL], None)
+    matches = self._flann.knnMatch(des1, des2, k=2)
+    # store all the good matches as per Lowe's ratio test.
+    good = []
+    for m, n in matches:
+      if m.distance < 0.7 * n.distance:
+        good.append(m)
+    if len(good) >= 10:
+      print 'Success tracking!'
+      src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+      dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+      M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+      pipeline[TRACKING_FINAL] = cv2.warpPerspective(pipeline[TRACKING_GRAY], M, pattern.shape)
+    else:
+      print "Not enough matches are found - %d/%d" % (len(good), 10)
+      matchesMask = None
 
 
 def _BuildGridImage(size):

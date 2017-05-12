@@ -101,6 +101,8 @@ class MainWindow(QDialog):
     # Processing thread.
     self._status_lock = threading.Lock()
     self._status = RUN
+    self._mode_lock = threading.Lock()
+    self._mode = 'c'  # 't'
     self._display_groundtruth_lock = threading.Lock()
     self._display_groundtruth = False
     self._must_reprocess_lock = threading.Lock()
@@ -254,9 +256,13 @@ class MainWindow(QDialog):
           with self._flip_lock:
             if self._flip:
               img = cv2.flip(img, 0)
-          self._vision.Calibrate(img)
-          with self._display_step_lock:
-            right_image, boardsize, left_image = self._vision.GetCalibrationResult(self._display_step)
+          with self._mode_lock:
+            if self._mode == 'c':
+              self._vision.Calibrate(img)
+              with self._display_step_lock:
+                right_image, boardsize, left_image = self._vision.GetCalibrationResult(self._display_step)
+            elif self._mode == 't':
+              self._vision.Track(img)
           with self._display_image_lock:
             self._display_image_left = self.ConvertToQImage(left_image, width=480) if left_image is not None else None
             self._display_image_right = self.ConvertToQImage(right_image) if right_image is not None else None
@@ -327,6 +333,16 @@ class MainWindow(QDialog):
     elif 'n' == QKeyEvent.text():
       print 'Getting next static image...'
       self._capture.Next()
+      with self._must_reprocess_lock:
+        self._must_reprocess = True
+    elif 't' == QKeyEvent.text():
+      with self._mode_lock:
+        self._mode = 't'
+      with self._must_reprocess_lock:
+        self._must_reprocess = True
+    elif 'c' == QKeyEvent.text():
+      with self._mode_lock:
+        self._mode = 'c'
       with self._must_reprocess_lock:
         self._must_reprocess = True
     elif 'p' == QKeyEvent.text():
