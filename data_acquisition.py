@@ -263,6 +263,8 @@ class MainWindow(QDialog):
                 right_image, boardsize, left_image = self._vision.GetCalibrationResult(self._display_step)
             elif self._mode == 't':
               self._vision.Track(img)
+              with self._display_step_lock:
+                right_image, left_image = self._vision.GetTrackingResult()
           with self._display_image_lock:
             self._display_image_left = self.ConvertToQImage(left_image, width=480) if left_image is not None else None
             self._display_image_right = self.ConvertToQImage(right_image) if right_image is not None else None

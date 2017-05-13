@@ -188,9 +188,26 @@ class Vision(object):
     # For display only.
     if self._debug:
       for step in ALL_UNPROJECTED_CALIBRATION_STEPS:
+        if len(pipeline[step].shape) == 2:
+          pipeline[step] = cv2.cvtColor(pipeline[step], cv2.COLOR_GRAY2BGR)
         cv2.drawContours(pipeline[step], [best_contour], -1, (0, 255, 0), 2)
     self._StoreCalibrationResult(pipeline, best_size)
     return True
+
+  def _StoreTrackingResult(self, pipeline):
+    with self._calibration_result_lock(rw_lock.WRITE_LOCKED):
+      # Only store a new calibration image if there is one.
+      if self._debug:
+        with self._debug_tracking_pipeline_lock(rw_lock.WRITE_LOCKED):
+          self._debug_tracking_pipeline = pipeline
+
+  def GetTrackingResult(self, debug_step=TRACKING_ORIGINAL):
+    # This function should really only be used in debug mode.
+    assert self._debug
+    with self._tracking_result_lock(rw_lock.READ_LOCKED):
+      with self._debug_tracking_pipeline_lock(rw_lock.READ_LOCKED):
+        return (self._debug_tracking_pipeline[TRACKING_FINAL].copy() if self._debug_tracking_pipeline[TRACKING_FINAL] is not None else None,
+                self._debug_tracking_pipeline[debug_step].copy() if self._debug_tracking_pipeline[debug_step] is not None else None)
 
   def Track(self, input_image):
     with self._calibration_result_lock(rw_lock.READ_LOCKED):
@@ -215,11 +232,20 @@ class Vision(object):
       print 'Success tracking!'
       src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
       dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-      M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-      pipeline[TRACKING_FINAL] = cv2.warpPerspective(pipeline[TRACKING_GRAY], M, pattern.shape)
+      M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)  # pattern -> image.
+      pipeline[TRACKING_FINAL] = cv2.warpPerspective(
+          pipeline[TRACKING_GRAY], cv2.invert(M)[1], pattern.shape)
+      if self._debug:
+        h, w = pattern.shape
+        pts = np.float32([[0,0],[0,h-1],[w-1,h-1],[w-1,0]]).reshape(-1,1,2)
+        dst = cv2.perspectiveTransform(pts, M)
+        cv2.polylines(pipeline[TRACKING_ORIGINAL],[np.int32(dst)], True, 255, 3)
+        pipeline[TRACKING_ORIGINAL] = cv2.drawKeypoints(pipeline[TRACKING_ORIGINAL], kp2, color=(0, 255, 0))
+        # pipeline[TRACKING_FINAL] = cv2.drawKeypoints(pipeline[TRACKING_FINAL], kp1, color=(0, 255, 0))
     else:
-      print "Not enough matches are found - %d/%d" % (len(good), 10)
-      matchesMask = None
+      print 'Not enough matches are found - %d/%d' % (len(good), 10)
+      pipeline[TRACKING_FINAL] = None
+    self._StoreTrackingResult(pipeline)
 
 
 def _BuildGridImage(size):
