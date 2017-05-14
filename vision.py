@@ -65,15 +65,16 @@ class Vision(object):
     self._boardsize = None
     self._calibration_image = None
     # Tracking.
-    self._tracking_result_lock = rw_lock.RWLock()
-    self._tracking_image = None
+    self._keypoints = None
+    self._descriptors = None
     use_sift = False
     if use_sift:
       self._keypoint_detector = cv2.SIFT()
       self._flann = cv2.FlannBasedMatcher({'algorithm': 0, 'trees': 5}, {'checks': 50})
     else:
       self._keypoint_detector = cv2.ORB()
-      self._flann = cv2.FlannBasedMatcher({'algorithm': 6, 'table_number': 6, 'key_size': 12,  'multi_probe_level': 1}, {'checks': 100})
+      self._flann = cv2.FlannBasedMatcher({'algorithm': 6, 'table_number': 6, 'key_size': 12,  'multi_probe_level': 1},
+                                          {'checks': 100})
     # Debugging mode keeps track of all intermediate processing steps.
     self._debug = debug
     self._debug_calibration_pipeline_lock = rw_lock.RWLock()
@@ -101,6 +102,7 @@ class Vision(object):
       if pipeline[CALIBRATION_FINAL] is not None:
         self._calibration_image = pipeline[CALIBRATION_FINAL]
         self._boardsize = boardsize
+        self._keypoints, self._descriptors = self._keypoint_detector.detectAndCompute(self._calibration_image, None)
       if self._debug:
         with self._debug_calibration_pipeline_lock(rw_lock.WRITE_LOCKED):
           self._debug_calibration_pipeline = pipeline
@@ -207,66 +209,59 @@ class Vision(object):
     return True
 
   def _StoreTrackingResult(self, pipeline):
-    with self._calibration_result_lock(rw_lock.WRITE_LOCKED):
-      # Only store a new calibration image if there is one.
-      if self._debug:
-        with self._debug_tracking_pipeline_lock(rw_lock.WRITE_LOCKED):
-          self._debug_tracking_pipeline = pipeline
+    if self._debug:
+      with self._debug_tracking_pipeline_lock(rw_lock.WRITE_LOCKED):
+        self._debug_tracking_pipeline = pipeline
 
   def GetTrackingResult(self, debug_step=TRACKING_ORIGINAL):
     # This function should really only be used in debug mode.
     assert self._debug
-    with self._tracking_result_lock(rw_lock.READ_LOCKED):
-      with self._debug_tracking_pipeline_lock(rw_lock.READ_LOCKED):
-        return (self._debug_tracking_pipeline[TRACKING_FINAL].copy() if self._debug_tracking_pipeline[TRACKING_FINAL] is not None else None,
-                self._debug_tracking_pipeline[debug_step].copy() if self._debug_tracking_pipeline[debug_step] is not None else None)
+    with self._debug_tracking_pipeline_lock(rw_lock.READ_LOCKED):
+      return (self._debug_tracking_pipeline[TRACKING_FINAL].copy() if self._debug_tracking_pipeline[TRACKING_FINAL] is not None else None,
+              self._debug_tracking_pipeline[debug_step].copy() if self._debug_tracking_pipeline[debug_step] is not None else None)
 
   def Track(self, input_image):
     with self._calibration_result_lock(rw_lock.READ_LOCKED):
-      pattern = self._calibration_image.copy()
+      assert self._keypoints is not None and self._descriptors is not None
+      pattern = self._calibration_image
 
-    # Keep track of all images. In debug mode, these images are
-    # then copied atomically. Otherwise they are discarded.
-    pipeline = {}
-    pipeline[TRACKING_ORIGINAL] = util.ResizeImage(input_image, height=720)
-    pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
+      # Keep track of all images. In debug mode, these images are
+      # then copied atomically. Otherwise they are discarded.
+      pipeline = {}
+      pipeline[TRACKING_ORIGINAL] = util.ResizeImage(input_image, height=720)
+      pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
 
-    # Taken from http://docs.opencv.org/3.0-beta/doc/py_tutorials/py_feature2d/py_feature_homography/py_feature_homography.html#py-feature-homography.
-    s = time.time()
-    kp1, des1 = self._keypoint_detector.detectAndCompute(pattern, None)
-    self._total_times[0] += time.time() - s
-    self._counts[0] += 1
-    s = time.time()
-    kp2, des2 = self._keypoint_detector.detectAndCompute(pipeline[TRACKING_ORIGINAL], None)
-    self._total_times[1] += time.time() - s
-    self._counts[1] += 1
-    s = time.time()
-    # des1 = des1.astype(np.float32)
-    # des2 = des2.astype(np.float32)
-    matches = self._flann.knnMatch(des1, des2, k=2)
-    self._total_times[2] += time.time() - s
-    self._counts[2] += 1
-    # store all the good matches as per Lowe's ratio test.
-    matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * 0.75]
-    if len(matches) >= 10:
-      print 'Success tracking!'
-      src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-      dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+      # Taken from http://docs.opencv.org/3.0-beta/doc/py_tutorials/py_feature2d/py_feature_homography/py_feature_homography.html#py-feature-homography.
       s = time.time()
-      M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)  # pattern -> image.
-      self._total_times[3] += time.time() - s
-      self._counts[3] += 1
-      pipeline[TRACKING_FINAL] = cv2.warpPerspective(
-          pipeline[TRACKING_GRAY], cv2.invert(M)[1], pattern.shape)
-      if self._debug:
-        h, w = pattern.shape
-        pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-        dst = cv2.perspectiveTransform(pts, M)
-        cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
-    else:
-      print 'Not enough matches are found - %d/%d' % (len(matches), 10)
-      pipeline[TRACKING_FINAL] = None
-    self._StoreTrackingResult(pipeline)
+      kp, des = self._keypoint_detector.detectAndCompute(pipeline[TRACKING_GRAY], None)
+      self._total_times[1] += time.time() - s
+      self._counts[1] += 1
+      s = time.time()
+      matches = self._flann.knnMatch(self._descriptors, des, k=2)
+      self._total_times[2] += time.time() - s
+      self._counts[2] += 1
+      # store all the good matches as per Lowe's ratio test.
+      matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * 0.75]
+      if len(matches) >= 10:
+        print 'Success tracking! - %d/%d' % (len(matches), 10)
+        src_pts = np.float32([self._keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        s = time.time()
+        M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)  # pattern -> image.
+        self._total_times[3] += time.time() - s
+        self._counts[3] += 1
+        pipeline[TRACKING_FINAL] = cv2.warpPerspective(
+            pipeline[TRACKING_GRAY], cv2.invert(M)[1], pattern.shape)
+        if self._debug:
+          h, w = pattern.shape
+          pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+          dst = cv2.perspectiveTransform(pts, M)
+          cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
+      else:
+        print 'Not enough matches are found - %d/%d' % (len(matches), 10)
+        pipeline[TRACKING_FINAL] = None
+      self._StoreTrackingResult(pipeline)
+    print 'Done track'
 
 
 def _BuildGridImage(size):
