@@ -1,9 +1,10 @@
+import collections
 import copy
 import cv2
 import numpy as np
-import time
 
 import rw_lock
+import timer
 import util
 
 
@@ -17,8 +18,8 @@ CALIBRATION_THRESHOLD = 5
 CALIBRATION_CONTOUR = 6
 CALIBRATION_VOTE = 7
 CALIBRATION_FINAL = 8
-ALL_CALIBRATION_STEPS = range(9)
-ALL_UNPROJECTED_CALIBRATION_STEPS = [
+ALL_CALIBRATION_STEPS = set(range(9))
+ALL_UNPROJECTED_CALIBRATION_STEPS = set([
     CALIBRATION_ORIGINAL,
     CALIBRATION_GRAY,
     CALIBRATION_BLUR,
@@ -26,22 +27,29 @@ ALL_UNPROJECTED_CALIBRATION_STEPS = [
     CALIBRATION_DIV,
     CALIBRATION_THRESHOLD,
     CALIBRATION_CONTOUR,
-]
+])
 
 # Tracking steps.
-TRACKING_ORIGINAL = 0
-TRACKING_GRAY = 1
-TRACKING_MATCHES = 2
-TRACKING_FINAL = 3
-ALL_TRACKING_STEPS = range(4)
+TRACKING_ORIGINAL = 20
+TRACKING_GRAY = 21
+TRACKING_RESIZE = 22
+TRACKING_MATCHES = 23
+TRACKING_FINAL = 24
+ALL_TRACKING_STEPS = set(range(20, 25))
+
+# For API clarity.
+CALIBRATION_OR_TRACKING_ORIGINAL = 100
 
 # Fixed parameters.
 _VOTE_SIZE = 200
 _VOTE_MARGIN = 5
+_CORNER_TRACK_SIZE = 60  # Corners should not more than half of this.
 SQUARE_SIZE = 25
 MARGIN = 13
 
 
+# This class is mostly NOT multi-threaded. Only the parameters can be changed atomically.
+# In particular: Calibrate/Track/GetCalibrationResults and GetTrackingResults cannot be called concurrently.
 class Vision(object):
 
   def __init__(self, debug=False):
@@ -55,66 +63,72 @@ class Vision(object):
         'ctr_size': 200,
         'approx': 0.01,
         'vote': 50,
+        'match_k': 2,
+        'match_sim': 0.75,
+        'match_min': 30,
+        'ransac_th': 5,
     }
     # Masks used to detect the board size.
     self._board_masks = {}
     for size in (9, 13, 19):
       self._board_masks[size] = _BuildGridImage(size)
     # Calibration.
-    self._calibration_result_lock = rw_lock.RWLock()
     self._boardsize = None
     self._calibration_image = None
     # Tracking.
-    self._keypoints = None
-    self._descriptors = None
-    use_sift = False
-    if use_sift:
-      self._keypoint_detector = cv2.SIFT()
-      self._flann = cv2.FlannBasedMatcher({'algorithm': 0, 'trees': 5}, {'checks': 50})
-    else:
-      self._keypoint_detector = cv2.ORB()
-      self._flann = cv2.FlannBasedMatcher({'algorithm': 6, 'table_number': 6, 'key_size': 12,  'multi_probe_level': 1},
-                                          {'checks': 100})
+    self._tracking_image = None
+    self._corner_offsets = [None] * 4
+    self._corners = [None] * 4
     # Debugging mode keeps track of all intermediate processing steps.
     self._debug = debug
-    self._debug_calibration_pipeline_lock = rw_lock.RWLock()
     self._debug_calibration_pipeline = {}
     for step in ALL_CALIBRATION_STEPS:
       self._debug_calibration_pipeline[step] = None
-    self._debug_tracking_pipeline_lock = rw_lock.RWLock()
     self._debug_tracking_pipeline = {}
     for step in ALL_TRACKING_STEPS:
       self._debug_tracking_pipeline[step] = None
     # Statistics.
-    self._total_times = [0., 0., 0., 0.]
-    self._counts = [0, 0, 0, 0]
+    self._timers = collections.defaultdict(timer.Timer)
 
   def Stop(self):
-    print 'Stats in seconds:', np.array(self._total_times) / np.array(self._counts).astype(np.float32)
+    pass
 
   def SetParameter(self, param_name, param_value):
     with self._parameters_lock(rw_lock.WRITE_LOCKED):
       self._parameters[param_name] = param_value
 
-  def _StoreCalibrationResult(self, pipeline, boardsize=0):
-    with self._calibration_result_lock(rw_lock.WRITE_LOCKED):
-      # Only store a new calibration image if there is one.
-      if pipeline[CALIBRATION_FINAL] is not None:
-        self._calibration_image = pipeline[CALIBRATION_FINAL]
-        self._boardsize = boardsize
-        self._keypoints, self._descriptors = self._keypoint_detector.detectAndCompute(self._calibration_image, None)
-      if self._debug:
-        with self._debug_calibration_pipeline_lock(rw_lock.WRITE_LOCKED):
-          self._debug_calibration_pipeline = pipeline
+  def _CopyTimingsMs(self):
+    return sorted((k, t.GetMs()) for k, t in self._timers.iteritems())
+
+  def _StoreCalibrationResult(self, pipeline, boardsize=0, gray_image=None, corners=None):
+    if self._debug:
+      self._debug_calibration_pipeline = pipeline
+    if pipeline[CALIBRATION_FINAL] is None:
+      return False
+    # Store corner templates for tracking.
+    points = corners.astype(np.int32)
+    margin = _CORNER_TRACK_SIZE / 2
+    for i, (x, y) in enumerate(points):
+      img = gray_image[y - margin:y + margin, x - margin:x + margin]
+      best_corner = cv2.goodFeaturesToTrack(img, 1, 0.01, 3)
+      if best_corner is None:
+        return False
+      self._corner_offsets[i] = np.array([x, y], dtype=np.float32)
+      self._corners[i] = np.squeeze(best_corner[0]) - margin + self._corner_offsets[i]
+    # Only store a new calibration image if there is one.
+    self._calibration_image = pipeline[CALIBRATION_FINAL]
+    self._boardsize = boardsize
+    return True
 
   def GetCalibrationResult(self, debug_step=CALIBRATION_ORIGINAL):
     # This function should really only be used in debug mode.
     assert self._debug
-    with self._calibration_result_lock(rw_lock.READ_LOCKED):
-      with self._debug_calibration_pipeline_lock(rw_lock.READ_LOCKED):
-        return (self._calibration_image.copy() if self._calibration_image is not None else None,
-                self._boardsize,
-                self._debug_calibration_pipeline[debug_step].copy() if self._debug_calibration_pipeline[debug_step] is not None else None)
+    if debug_step not in ALL_CALIBRATION_STEPS:
+      debug_step = CALIBRATION_ORIGINAL
+    return (self._calibration_image.copy() if self._calibration_image is not None else None,
+            self._boardsize,
+            self._debug_calibration_pipeline[debug_step].copy() if self._debug_calibration_pipeline[debug_step] is not None else None,
+            self._CopyTimingsMs())
 
   def Calibrate(self, input_image):
     """Finds an almost-empty Go board in an image."""
@@ -125,143 +139,168 @@ class Vision(object):
     # Keep track of all images. In debug mode, these images are
     # then copied atomically. Otherwise they are discarded.
     pipeline = {}
-    pipeline[CALIBRATION_ORIGINAL] = util.ResizeImage(input_image, height=720)
+    with self._timers['c_resize']:
+      pipeline[CALIBRATION_ORIGINAL] = util.ResizeImage(input_image, height=720)
 
     # Blur + Grayscale.
-    pipeline[CALIBRATION_GRAY] = cv2.cvtColor(pipeline[CALIBRATION_ORIGINAL], cv2.COLOR_BGR2GRAY)
-    pipeline[CALIBRATION_BLUR] = cv2.GaussianBlur(pipeline[CALIBRATION_GRAY], (params['blur'], params['blur']), 0)
+    with self._timers['c_gray_blur']:
+      gray = cv2.cvtColor(pipeline[CALIBRATION_ORIGINAL], cv2.COLOR_BGR2GRAY)
+      pipeline[CALIBRATION_GRAY] = gray.copy() if self._debug else gray
+      pipeline[CALIBRATION_BLUR] = cv2.GaussianBlur(pipeline[CALIBRATION_GRAY], (params['blur'], params['blur']), 0)
 
     # The following sequence removes small lines.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params['close'], params['close']))
-    pipeline[CALIBRATION_CLOSE] = cv2.morphologyEx(pipeline[CALIBRATION_BLUR], cv2.MORPH_CLOSE, kernel)
+    with self._timers['c_close']:
+      kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params['close'], params['close']))
+      pipeline[CALIBRATION_CLOSE] = cv2.morphologyEx(pipeline[CALIBRATION_BLUR], cv2.MORPH_CLOSE, kernel)
 
     # Small lines that were removed will pop.
-    div = np.float32(pipeline[CALIBRATION_BLUR]) / (pipeline[CALIBRATION_CLOSE] + 1e-4)
-    pipeline[CALIBRATION_DIV] = np.uint8(cv2.normalize(div, div, 0, 255, cv2.NORM_MINMAX))
+    with self._timers['c_div']:
+      div = np.float32(pipeline[CALIBRATION_BLUR]) / (pipeline[CALIBRATION_CLOSE] + 1e-4)
+      pipeline[CALIBRATION_DIV] = np.uint8(cv2.normalize(div, div, 0, 255, cv2.NORM_MINMAX))
 
     # Threshold.
-    output = cv2.adaptiveThreshold(pipeline[CALIBRATION_DIV], 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                   cv2.THRESH_BINARY_INV, params['th_block'], params['th_mean'])
-    pipeline[CALIBRATION_THRESHOLD] = output.copy()  # Reused later. However findContours overwrites it :(
+    with self._timers['c_threshold']:
+      output = cv2.adaptiveThreshold(pipeline[CALIBRATION_DIV], 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                     cv2.THRESH_BINARY_INV, params['th_block'], params['th_mean'])
+      pipeline[CALIBRATION_THRESHOLD] = output.copy()  # Reused later. However findContours overwrites it :(
 
     # Find the largest contour.
-    contours, _ = cv2.findContours(output, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    max_area = 0
-    all_valid_contours = []  # Used for debug only.
-    best_contour = None
-    for contour in contours:
-      area = cv2.contourArea(contour)
-      if area > params['ctr_size'] * params['ctr_size']:
-        all_valid_contours.append(contour)  # Used for debug only.
-        if area > max_area:
-          best_contour = contour
-          max_area = area
+    with self._timers['c_contour']:
+      contours, _ = cv2.findContours(output, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+      max_area = 0
+      all_valid_contours = []  # Used for debug only.
+      best_contour = None
+      for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > params['ctr_size'] * params['ctr_size']:
+          all_valid_contours.append(contour)  # Used for debug only.
+          if area > max_area:
+            best_contour = contour
+            max_area = area
     # Fit a square to the best contour.
     if best_contour is not None:
-      best_contour = util.SimplifyContour(best_contour, approximation_eps=params['approx'])
+      with self._timers['c_simplify']:
+        best_contour = util.SimplifyContour(best_contour, approximation_eps=params['approx'])
     # For display only.
     if self._debug:
-      pipeline[CALIBRATION_CONTOUR] = cv2.cvtColor(pipeline[CALIBRATION_THRESHOLD].copy(), cv2.COLOR_GRAY2BGR)
-      cv2.drawContours(pipeline[CALIBRATION_CONTOUR], all_valid_contours, -1, (255, 0, 0), 2)
-      if best_contour is not None:
-        cv2.drawContours(pipeline[CALIBRATION_CONTOUR], [best_contour], -1, (0, 0, 255), 4)
+      with self._timers['c_dbg']:
+        pipeline[CALIBRATION_CONTOUR] = cv2.cvtColor(pipeline[CALIBRATION_THRESHOLD].copy(), cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(pipeline[CALIBRATION_CONTOUR], all_valid_contours, -1, (255, 0, 0), 2)
+        if best_contour is not None:
+          cv2.drawContours(pipeline[CALIBRATION_CONTOUR], [best_contour], -1, (0, 0, 255), 4)
     # We found nothing.
     if best_contour is None:
       pipeline[CALIBRATION_VOTE] = None
       pipeline[CALIBRATION_FINAL] = None
-      self._StoreCalibrationResult(pipeline)
-      return False
+      return self._StoreCalibrationResult(pipeline)
 
     original_points = _OrderPoints(np.squeeze(best_contour))
 
     # We detect the board size by first projecting the detected and counting the number of lines.
-    destination_points = _OrderPoints(np.float32([
-        [0, 0], [0, _VOTE_SIZE], [_VOTE_SIZE, _VOTE_SIZE],
-        [_VOTE_SIZE, 0]])) + _VOTE_MARGIN
-    M = cv2.getPerspectiveTransform(original_points, destination_points)
-    pipeline[CALIBRATION_VOTE] = cv2.warpPerspective(
-        pipeline[CALIBRATION_THRESHOLD], M, (_VOTE_SIZE + 2 * _VOTE_MARGIN,
-                                             _VOTE_SIZE + 2 * _VOTE_MARGIN))
-    best_vote, best_size = max((float(np.sum(pipeline[CALIBRATION_VOTE] * m)) / float(np.sum(m)), s) for s, m in self._board_masks.iteritems())
+    with self._timers['c_wrap_1']:
+      destination_points = _OrderPoints(np.float32([
+          [0, 0], [0, _VOTE_SIZE], [_VOTE_SIZE, _VOTE_SIZE],
+          [_VOTE_SIZE, 0]])) + _VOTE_MARGIN
+      M = cv2.getPerspectiveTransform(original_points, destination_points)
+      pipeline[CALIBRATION_VOTE] = cv2.warpPerspective(
+          pipeline[CALIBRATION_THRESHOLD], M, (_VOTE_SIZE + 2 * _VOTE_MARGIN,
+                                               _VOTE_SIZE + 2 * _VOTE_MARGIN))
+    with self._timers['c_template']:
+      best_vote, best_size = max((float(np.sum(pipeline[CALIBRATION_VOTE] * m)) / float(np.sum(m)), s) for s, m in self._board_masks.iteritems())
     # For display only.
     if self._debug:
       pipeline[CALIBRATION_VOTE] *= self._board_masks[best_size]
     # We cannot detect the size.
     if best_vote < params['vote']:
       pipeline[CALIBRATION_FINAL] = None
-      self._StoreCalibrationResult(pipeline)
-      return False
+      return self._StoreCalibrationResult(pipeline)
     # Set boardsize.
     boardsize_pixel = SQUARE_SIZE * (best_size - 1)
     # Reproject to the right size.
-    image_pixel = boardsize_pixel + 2 * MARGIN
-    destination_points = _OrderPoints(np.float32([[0, 0], [0, boardsize_pixel], [boardsize_pixel, boardsize_pixel],
-                                                  [boardsize_pixel, 0]])) + MARGIN
-    M = cv2.getPerspectiveTransform(original_points, destination_points)
-    pipeline[CALIBRATION_FINAL] = cv2.warpPerspective(pipeline[CALIBRATION_GRAY], M, (image_pixel, image_pixel))
+    with self._timers['c_wrap_2']:
+      image_pixel = boardsize_pixel + 2 * MARGIN
+      destination_points = _OrderPoints(np.float32([[0, 0], [0, boardsize_pixel], [boardsize_pixel, boardsize_pixel],
+                                                    [boardsize_pixel, 0]])) + MARGIN
+      M = cv2.getPerspectiveTransform(original_points, destination_points)
+      pipeline[CALIBRATION_FINAL] = cv2.warpPerspective(pipeline[CALIBRATION_GRAY], M, (image_pixel, image_pixel))
     # For display only.
     if self._debug:
-      for step in ALL_UNPROJECTED_CALIBRATION_STEPS:
-        if len(pipeline[step].shape) == 2:
-          pipeline[step] = cv2.cvtColor(pipeline[step], cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(pipeline[step], [best_contour], -1, (0, 255, 0), 2)
-    self._StoreCalibrationResult(pipeline, best_size)
-    return True
+      with self._timers['c_dbg']:
+        for step in ALL_UNPROJECTED_CALIBRATION_STEPS:
+          if len(pipeline[step].shape) == 2:
+            pipeline[step] = cv2.cvtColor(pipeline[step], cv2.COLOR_GRAY2BGR)
+          cv2.drawContours(pipeline[step], [best_contour], -1, (0, 255, 0), 2)
+    return self._StoreCalibrationResult(pipeline, best_size, gray, original_points)
 
   def _StoreTrackingResult(self, pipeline):
+    # Only store a new calibration image if there is one.
+    if pipeline[TRACKING_FINAL] is not None:
+      self._tracking_image = pipeline[TRACKING_FINAL]
     if self._debug:
-      with self._debug_tracking_pipeline_lock(rw_lock.WRITE_LOCKED):
-        self._debug_tracking_pipeline = pipeline
+      self._debug_tracking_pipeline = pipeline
 
   def GetTrackingResult(self, debug_step=TRACKING_ORIGINAL):
     # This function should really only be used in debug mode.
     assert self._debug
-    with self._debug_tracking_pipeline_lock(rw_lock.READ_LOCKED):
-      return (self._debug_tracking_pipeline[TRACKING_FINAL].copy() if self._debug_tracking_pipeline[TRACKING_FINAL] is not None else None,
-              self._debug_tracking_pipeline[debug_step].copy() if self._debug_tracking_pipeline[debug_step] is not None else None)
+    if debug_step not in ALL_TRACKING_STEPS:
+      debug_step = TRACKING_ORIGINAL
+    return (self._tracking_image.copy() if self._tracking_image is not None else None,
+            self._debug_tracking_pipeline[debug_step].copy() if self._debug_tracking_pipeline[debug_step] is not None else None,
+            self._CopyTimingsMs())
 
   def Track(self, input_image):
-    with self._calibration_result_lock(rw_lock.READ_LOCKED):
-      assert self._keypoints is not None and self._descriptors is not None
-      pattern = self._calibration_image
+    # Keep local parameter copy.
+    with self._parameters_lock(rw_lock.READ_LOCKED):
+      params = copy.deepcopy(self._parameters)
 
-      # Keep track of all images. In debug mode, these images are
-      # then copied atomically. Otherwise they are discarded.
-      pipeline = {}
+    assert self._calibration_image is not None
+    # Calibration was successful.
+
+    # Keep track of all images. In debug mode, these images are
+    # then copied atomically. Otherwise they are discarded.
+    pipeline = {}
+    with self._timers['t_resize']:
       pipeline[TRACKING_ORIGINAL] = util.ResizeImage(input_image, height=720)
-      pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
+    with self._timers['t_gray']:
+      gray = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
 
-      # Taken from http://docs.opencv.org/3.0-beta/doc/py_tutorials/py_feature2d/py_feature_homography/py_feature_homography.html#py-feature-homography.
-      s = time.time()
-      kp, des = self._keypoint_detector.detectAndCompute(pipeline[TRACKING_GRAY], None)
-      self._total_times[1] += time.time() - s
-      self._counts[1] += 1
-      s = time.time()
-      matches = self._flann.knnMatch(self._descriptors, des, k=2)
-      self._total_times[2] += time.time() - s
-      self._counts[2] += 1
-      # store all the good matches as per Lowe's ratio test.
-      matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * 0.75]
-      if len(matches) >= 10:
-        print 'Success tracking! - %d/%d' % (len(matches), 10)
-        src_pts = np.float32([self._keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-        s = time.time()
-        M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)  # pattern -> image.
-        self._total_times[3] += time.time() - s
-        self._counts[3] += 1
-        pipeline[TRACKING_FINAL] = cv2.warpPerspective(
-            pipeline[TRACKING_GRAY], cv2.invert(M)[1], pattern.shape)
-        if self._debug:
-          h, w = pattern.shape
-          pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-          dst = cv2.perspectiveTransform(pts, M)
-          cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
-      else:
-        print 'Not enough matches are found - %d/%d' % (len(matches), 10)
+    margin = _CORNER_TRACK_SIZE / 2
+    for i, (origin, corner) in enumerate(zip(self._corner_offsets, self._corners)):
+      # Draw corners for debug.
+      if self._debug:
+        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(origin), 3, (255, 0, 0), -1)
+        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(corner), 3, (0, 255, 0), -1)
+
+      ox, oy = origin.astype(np.int32)
+      img = gray[oy - margin:oy + margin, ox - margin:ox + margin]
+      best_corners = cv2.goodFeaturesToTrack(img, 1, 0.01, 3)
+      if best_corners is None:
+        # Update other corners if possible.
         pipeline[TRACKING_FINAL] = None
-      self._StoreTrackingResult(pipeline)
-    print 'Done track'
+        self._StoreTrackingResult(pipeline)
+        return False
+      best_corners = np.squeeze(best_corners) + origin - margin
+      offsets = best_corners - corner.reshape((-1, 2))
+      index = np.argmin(np.sum(np.square(offsets)))
+      offset = offsets[index]
+      self._corner_offsets[i] += offset
+      self._corners[i] += offset
+      if self._debug:
+        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(self._corners[i]), 3, (0, 0, 255), -1)
+        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(self._corner_offsets[i]), 3, (255, 255, 255), -1)
+
+    # Set boardsize.
+    boardsize_pixel = SQUARE_SIZE * (self._boardsize - 1)
+    # Reproject to the right size.
+    with self._timers['t_wrap']:
+      image_pixel = boardsize_pixel + 2 * MARGIN
+      original_points = _OrderPoints(np.float32(self._corner_offsets))
+      destination_points = _OrderPoints(np.float32([[0, 0], [0, boardsize_pixel], [boardsize_pixel, boardsize_pixel],
+                                                    [boardsize_pixel, 0]])) + MARGIN
+      M = cv2.getPerspectiveTransform(original_points, destination_points)
+      pipeline[TRACKING_FINAL] = cv2.warpPerspective(gray, M, (image_pixel, image_pixel))
+    self._StoreTrackingResult(pipeline)
+    return True
 
 
 def _BuildGridImage(size):
@@ -286,3 +325,22 @@ def _OrderPoints(pts):
   i = np.argmax([y for x, y in pts])
   i = np.array((i + np.arange(len(pts))) % len(pts))
   return np.float32(pts[i, :])
+
+
+def _DrawMatches(img1, kp1, img2, kp2, matches):
+  rows1 = img1.shape[0]
+  cols1 = img1.shape[1]
+  rows2 = img2.shape[0]
+  cols2 = img2.shape[1]
+  out = np.ones((max([rows1, rows2]), cols1 + cols2, 3), dtype='uint8') * 255
+  out[:rows1, :cols1] = np.dstack([img1, img1, img1])
+  out[:rows2, cols1:] = np.dstack([img2, img2, img2])
+  for mat in matches:
+    img1_idx = mat.queryIdx
+    img2_idx = mat.trainIdx
+    x1, y1 = kp1[img1_idx].pt
+    x2, y2 = kp2[img2_idx].pt
+    cv2.circle(out, (int(x1), int(y1)), 4, (255, 0, 0), 1)
+    cv2.circle(out, (int(x2) + cols1, int(y2)), 4, (255, 0, 0), 1)
+    cv2.line(out, (int(x1), int(y1)), (int(x2) + cols1, int(y2)), (255, 0, 0), 1)
+  return out

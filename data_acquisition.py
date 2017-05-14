@@ -12,13 +12,17 @@ from PyQt4.QtGui import *
 from PyQt4.QtCore import *
 
 import capture
-import vision
+import timer
 import util
+import vision
 
 
 RUN = 0
 STOP = 1
 PAUSE = 2
+
+TRACKING = 0
+CALIBRATING = 1
 
 _ORIGNAL_WIDTH = 480
 _CROP_SIZE = 24  # Divisible by 8.
@@ -72,6 +76,10 @@ class MainWindow(QDialog):
     self.AddParameter('ctr_size', min_value=10, max_value=300, step_size=10, default_value=200, step=vision.CALIBRATION_CONTOUR)
     self.AddParameter('approx', min_value=0, max_value=1, step_size=0.01, default_value=0.01, step=vision.CALIBRATION_CONTOUR)
     self.AddParameter('vote', min_value=20, max_value=200, step_size=10, default_value=50, step=vision.CALIBRATION_VOTE)
+    self.AddParameter('match_k', min_value=1, max_value=5, step_size=1, default_value=2, step=vision.TRACKING_ORIGINAL)
+    self.AddParameter('match_sim', min_value=.5, max_value=1., step_size=.05, default_value=.75, step=vision.TRACKING_MATCHES)
+    self.AddParameter('match_min', min_value=0, max_value=100, step_size=10, default_value=30, step=vision.TRACKING_MATCHES)
+    self.AddParameter('ransac_th', min_value=1, max_value=10, step_size=1, default_value=5, step=vision.TRACKING_MATCHES)
 
     # Buttons (these are invisible originally).
     self._dataset_lock = threading.Lock()
@@ -94,15 +102,22 @@ class MainWindow(QDialog):
                              'border-radius: %dpx; ' % (self._button_size / 2))
         button.hide()
         self._buttons[-1].append(button)
+    # Timing information.
+    self._timings_label = QLabel('', self)
+    self._timings_label.move(_LAYOUT_MARGIN, _LAYOUT_MARGIN)
+    self._timings_label.setFixedSize(_ORIGNAL_WIDTH - 2 * _LAYOUT_MARGIN, _ORIGNAL_WIDTH - 2 * _LAYOUT_MARGIN)
+    self._timings_label.setStyleSheet('color: green')
+    self._timings_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
 
     # Capturing thread.
     self._capture = capture.VideoStream().Start()
+    self._timer = timer.Timer()
 
     # Processing thread.
     self._status_lock = threading.Lock()
     self._status = RUN
     self._mode_lock = threading.Lock()
-    self._mode = 'c'  # 't'
+    self._mode = CALIBRATING
     self._display_groundtruth_lock = threading.Lock()
     self._display_groundtruth = False
     self._must_reprocess_lock = threading.Lock()
@@ -146,7 +161,7 @@ class MainWindow(QDialog):
       return 1  # Black.
     return 2  # White.
 
-  def AddParameter(self, param_name, min_value, max_value, step_size, default_value, step='original'):
+  def AddParameter(self, param_name, min_value, max_value, step_size, default_value, step):
     self._vision.SetParameter(param_name, default_value)
     label = QLabel('%s: %g' % (param_name, default_value), self)
     label.move(_LAYOUT_MARGIN, self._param_offset)
@@ -183,7 +198,7 @@ class MainWindow(QDialog):
   def GetParameterReleasedFunction(self):
     def ReleasedParameter():
       with self._display_step_lock:
-        self._display_step = vision.CALIBRATION_ORIGINAL
+        self._display_step = vision.CALIBRATION_OR_TRACKING_ORIGINAL
       with self._must_reprocess_lock:
         self._must_reprocess = True
     return ReleasedParameter
@@ -257,19 +272,21 @@ class MainWindow(QDialog):
             if self._flip:
               img = cv2.flip(img, 0)
           with self._mode_lock:
-            if self._mode == 'c':
+            if self._mode == CALIBRATING:
               self._vision.Calibrate(img)
               with self._display_step_lock:
-                right_image, boardsize, left_image = self._vision.GetCalibrationResult(self._display_step)
-            elif self._mode == 't':
+                right_image, boardsize, left_image, timings = self._vision.GetCalibrationResult(self._display_step)
+            elif self._mode == TRACKING:
               self._vision.Track(img)
               with self._display_step_lock:
-                right_image, left_image = self._vision.GetTrackingResult()
+                right_image, left_image, timings = self._vision.GetTrackingResult(self._display_step)
           with self._display_image_lock:
             self._display_image_left = self.ConvertToQImage(left_image, width=480) if left_image is not None else None
             self._display_image_right = self.ConvertToQImage(right_image) if right_image is not None else None
             self._processed_image = right_image
             self._boardsize = boardsize
+          # Update timings.
+          self._timings_label.setText('\n'.join(('%s: %d [ms]' % (k, int(v))) for k, v in timings))
           self.update()
       time.sleep(0.01)
       with self._status_lock:
@@ -340,12 +357,12 @@ class MainWindow(QDialog):
         self._must_reprocess = True
     elif 't' == QKeyEvent.text():
       with self._mode_lock:
-        self._mode = 't'
+        self._mode = TRACKING
       with self._must_reprocess_lock:
         self._must_reprocess = True
     elif 'c' == QKeyEvent.text():
       with self._mode_lock:
-        self._mode = 'c'
+        self._mode = CALIBRATING
       with self._must_reprocess_lock:
         self._must_reprocess = True
     elif 'p' == QKeyEvent.text():

@@ -52,22 +52,24 @@ class VideoStream(object):
         if self._paused:
           time.sleep(0.001)
           continue
-      with self._frame_lock(rw_lock.WRITE_LOCKED):
-        if self._static_images is not None:
+      if self._static_images is not None:
+        with self._frame_lock(rw_lock.WRITE_LOCKED):
           with self._static_images_lock(rw_lock.READ_LOCKED):
             self._frame = self._static_images[self._static_image_index]
-        else:
-          _, self._frame = self._stream.read()
-          if self._frame is None and self._movie_file:
-            print 'Restarting movie'
-            # End of movie. Loop.
-            self._stream = cv2.VideoCapture(self._movie_file)
-            _, self._frame = self._stream.read()
+      else:
+        _, frame = self._stream.read()
+        if frame is None and self._movie_file:
+          print 'Restarting movie'
+          self._stream = cv2.VideoCapture(self._movie_file)
+          _, frame = self._stream.read()
+        with self._frame_lock(rw_lock.WRITE_LOCKED):
+          self._frame = frame
           with self._already_read_lock(rw_lock.WRITE_LOCKED):
             self._already_read = False
       if self._movie_file:
-        time.sleep(1. / 25.)
-      time.sleep(0.001)
+        time.sleep(.03)
+      else:
+        time.sleep(0.001)
 
   def Read(self):
     with self._frame_lock(rw_lock.READ_LOCKED):
