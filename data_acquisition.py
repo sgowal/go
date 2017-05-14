@@ -297,6 +297,7 @@ class MainWindow(QDialog):
       self._status = STOP
     print 'Stopping capture...'
     self._capture.Stop()
+    self._vision.Stop()
     print 'Quitting...'
 
   def keyPressEvent(self, QKeyEvent):

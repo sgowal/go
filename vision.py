@@ -1,6 +1,8 @@
 import copy
 import cv2
 import numpy as np
+import time
+
 import rw_lock
 import util
 
@@ -65,9 +67,13 @@ class Vision(object):
     # Tracking.
     self._tracking_result_lock = rw_lock.RWLock()
     self._tracking_image = None
-    self._sift = cv2.SIFT()
-    self._flann = cv2.FlannBasedMatcher({'algorithm': 0, 'trees': 5},
-                                        {'checks': 50})
+    use_sift = False
+    if use_sift:
+      self._keypoint_detector = cv2.SIFT()
+      self._flann = cv2.FlannBasedMatcher({'algorithm': 0, 'trees': 5}, {'checks': 50})
+    else:
+      self._keypoint_detector = cv2.ORB()
+      self._flann = cv2.FlannBasedMatcher({'algorithm': 6, 'table_number': 6, 'key_size': 12,  'multi_probe_level': 1}, {'checks': 100})
     # Debugging mode keeps track of all intermediate processing steps.
     self._debug = debug
     self._debug_calibration_pipeline_lock = rw_lock.RWLock()
@@ -78,6 +84,12 @@ class Vision(object):
     self._debug_tracking_pipeline = {}
     for step in ALL_TRACKING_STEPS:
       self._debug_tracking_pipeline[step] = None
+    # Statistics.
+    self._total_times = [0., 0., 0., 0.]
+    self._counts = [0, 0, 0, 0]
+
+  def Stop(self):
+    print 'Stats in seconds:', np.array(self._total_times) / np.array(self._counts).astype(np.float32)
 
   def SetParameter(self, param_name, param_value):
     with self._parameters_lock(rw_lock.WRITE_LOCKED):
@@ -220,30 +232,39 @@ class Vision(object):
     pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
 
     # Taken from http://docs.opencv.org/3.0-beta/doc/py_tutorials/py_feature2d/py_feature_homography/py_feature_homography.html#py-feature-homography.
-    kp1, des1 = self._sift.detectAndCompute(pattern, None)
-    kp2, des2 = self._sift.detectAndCompute(pipeline[TRACKING_ORIGINAL], None)
+    s = time.time()
+    kp1, des1 = self._keypoint_detector.detectAndCompute(pattern, None)
+    self._total_times[0] += time.time() - s
+    self._counts[0] += 1
+    s = time.time()
+    kp2, des2 = self._keypoint_detector.detectAndCompute(pipeline[TRACKING_ORIGINAL], None)
+    self._total_times[1] += time.time() - s
+    self._counts[1] += 1
+    s = time.time()
+    # des1 = des1.astype(np.float32)
+    # des2 = des2.astype(np.float32)
     matches = self._flann.knnMatch(des1, des2, k=2)
+    self._total_times[2] += time.time() - s
+    self._counts[2] += 1
     # store all the good matches as per Lowe's ratio test.
-    good = []
-    for m, n in matches:
-      if m.distance < 0.7 * n.distance:
-        good.append(m)
-    if len(good) >= 10:
+    matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * 0.75]
+    if len(matches) >= 10:
       print 'Success tracking!'
-      src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-      dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+      src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+      dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+      s = time.time()
       M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)  # pattern -> image.
+      self._total_times[3] += time.time() - s
+      self._counts[3] += 1
       pipeline[TRACKING_FINAL] = cv2.warpPerspective(
           pipeline[TRACKING_GRAY], cv2.invert(M)[1], pattern.shape)
       if self._debug:
         h, w = pattern.shape
-        pts = np.float32([[0,0],[0,h-1],[w-1,h-1],[w-1,0]]).reshape(-1,1,2)
+        pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
         dst = cv2.perspectiveTransform(pts, M)
-        cv2.polylines(pipeline[TRACKING_ORIGINAL],[np.int32(dst)], True, 255, 3)
-        pipeline[TRACKING_ORIGINAL] = cv2.drawKeypoints(pipeline[TRACKING_ORIGINAL], kp2, color=(0, 255, 0))
-        # pipeline[TRACKING_FINAL] = cv2.drawKeypoints(pipeline[TRACKING_FINAL], kp1, color=(0, 255, 0))
+        cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
     else:
-      print 'Not enough matches are found - %d/%d' % (len(good), 10)
+      print 'Not enough matches are found - %d/%d' % (len(matches), 10)
       pipeline[TRACKING_FINAL] = None
     self._StoreTrackingResult(pipeline)
 
