@@ -43,7 +43,6 @@ CALIBRATION_OR_TRACKING_ORIGINAL = 100
 # Fixed parameters.
 _VOTE_SIZE = 200
 _VOTE_MARGIN = 5
-_CORNER_TRACK_SIZE = 60  # Corners should not more than half of this.
 SQUARE_SIZE = 25
 MARGIN = 13
 
@@ -77,8 +76,16 @@ class Vision(object):
     self._calibration_image = None
     # Tracking.
     self._tracking_image = None
-    self._corner_offsets = [None] * 4
-    self._corners = [None] * 4
+    self._keypoints = None
+    self._descriptors = None
+    use_sift = False
+    if use_sift:
+      self._keypoint_detector = cv2.SIFT()
+      self._flann = cv2.FlannBasedMatcher({'algorithm': 0, 'trees': 5}, {'checks': 50})
+    else:
+      self._keypoint_detector = cv2.ORB()
+      self._flann = cv2.FlannBasedMatcher({'algorithm': 6, 'table_number': 6, 'key_size': 12,  'multi_probe_level': 1},
+                                          {'checks': 100})
     # Debugging mode keeps track of all intermediate processing steps.
     self._debug = debug
     self._debug_calibration_pipeline = {}
@@ -100,24 +107,15 @@ class Vision(object):
   def _CopyTimingsMs(self):
     return sorted((k, t.GetMs()) for k, t in self._timers.iteritems())
 
-  def _StoreCalibrationResult(self, pipeline, boardsize=0, gray_image=None, corners=None):
+  def _StoreCalibrationResult(self, pipeline, boardsize=0):
     if self._debug:
       self._debug_calibration_pipeline = pipeline
     if pipeline[CALIBRATION_FINAL] is None:
       return False
-    # Store corner templates for tracking.
-    points = corners.astype(np.int32)
-    margin = _CORNER_TRACK_SIZE / 2
-    for i, (x, y) in enumerate(points):
-      img = gray_image[y - margin:y + margin, x - margin:x + margin]
-      best_corner = cv2.goodFeaturesToTrack(img, 1, 0.01, 3)
-      if best_corner is None:
-        return False
-      self._corner_offsets[i] = np.array([x, y], dtype=np.float32)
-      self._corners[i] = np.squeeze(best_corner[0]) - margin + self._corner_offsets[i]
     # Only store a new calibration image if there is one.
     self._calibration_image = pipeline[CALIBRATION_FINAL]
     self._boardsize = boardsize
+    self._keypoints, self._descriptors = self._keypoint_detector.detectAndCompute(self._calibration_image, None)
     return True
 
   def GetCalibrationResult(self, debug_step=CALIBRATION_ORIGINAL):
@@ -230,14 +228,16 @@ class Vision(object):
           if len(pipeline[step].shape) == 2:
             pipeline[step] = cv2.cvtColor(pipeline[step], cv2.COLOR_GRAY2BGR)
           cv2.drawContours(pipeline[step], [best_contour], -1, (0, 255, 0), 2)
-    return self._StoreCalibrationResult(pipeline, best_size, gray, original_points)
+    return self._StoreCalibrationResult(pipeline, best_size)
 
   def _StoreTrackingResult(self, pipeline):
-    # Only store a new calibration image if there is one.
-    if pipeline[TRACKING_FINAL] is not None:
-      self._tracking_image = pipeline[TRACKING_FINAL]
     if self._debug:
       self._debug_tracking_pipeline = pipeline
+    # Only store a new calibration image if there is one.
+    if pipeline[TRACKING_FINAL] is None:
+      return False
+    self._tracking_image = pipeline[TRACKING_FINAL]
+    return True
 
   def GetTrackingResult(self, debug_step=TRACKING_ORIGINAL):
     # This function should really only be used in debug mode.
@@ -254,53 +254,46 @@ class Vision(object):
       params = copy.deepcopy(self._parameters)
 
     assert self._calibration_image is not None
+    pattern = self._calibration_image
     # Calibration was successful.
 
     # Keep track of all images. In debug mode, these images are
     # then copied atomically. Otherwise they are discarded.
     pipeline = {}
-    with self._timers['t_resize']:
+    with self._timers['t_resize_1']:
       pipeline[TRACKING_ORIGINAL] = util.ResizeImage(input_image, height=720)
     with self._timers['t_gray']:
-      gray = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
+      pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
+    with self._timers['t_resize_2']:
+      factor = 0.5
+      pipeline[TRACKING_RESIZE] = util.ResizeImage(pipeline[TRACKING_GRAY], height=int(pipeline[TRACKING_GRAY].shape[0] * factor))
 
-    margin = _CORNER_TRACK_SIZE / 2
-    for i, (origin, corner) in enumerate(zip(self._corner_offsets, self._corners)):
-      # Draw corners for debug.
-      if self._debug:
-        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(origin), 3, (255, 0, 0), -1)
-        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(corner), 3, (0, 255, 0), -1)
-
-      ox, oy = origin.astype(np.int32)
-      img = gray[oy - margin:oy + margin, ox - margin:ox + margin]
-      best_corners = cv2.goodFeaturesToTrack(img, 1, 0.01, 3)
-      if best_corners is None:
-        # Update other corners if possible.
-        pipeline[TRACKING_FINAL] = None
-        self._StoreTrackingResult(pipeline)
-        return False
-      best_corners = np.squeeze(best_corners) + origin - margin
-      offsets = best_corners - corner.reshape((-1, 2))
-      index = np.argmin(np.sum(np.square(offsets)))
-      offset = offsets[index]
-      self._corner_offsets[i] += offset
-      self._corners[i] += offset
-      if self._debug:
-        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(self._corners[i]), 3, (0, 0, 255), -1)
-        cv2.circle(pipeline[TRACKING_ORIGINAL], tuple(self._corner_offsets[i]), 3, (255, 255, 255), -1)
-
-    # Set boardsize.
-    boardsize_pixel = SQUARE_SIZE * (self._boardsize - 1)
-    # Reproject to the right size.
-    with self._timers['t_wrap']:
-      image_pixel = boardsize_pixel + 2 * MARGIN
-      original_points = _OrderPoints(np.float32(self._corner_offsets))
-      destination_points = _OrderPoints(np.float32([[0, 0], [0, boardsize_pixel], [boardsize_pixel, boardsize_pixel],
-                                                    [boardsize_pixel, 0]])) + MARGIN
-      M = cv2.getPerspectiveTransform(original_points, destination_points)
-      pipeline[TRACKING_FINAL] = cv2.warpPerspective(gray, M, (image_pixel, image_pixel))
-    self._StoreTrackingResult(pipeline)
-    return True
+    # Taken from http://docs.opencv.org/3.0-beta/doc/py_tutorials/py_feature2d/py_feature_homography/py_feature_homography.html#py-feature-homography.
+    with self._timers['t_keypoints']:
+      kp, des = self._keypoint_detector.detectAndCompute(pipeline[TRACKING_RESIZE], None)
+    with self._timers['t_matches']:
+      matches = self._flann.knnMatch(self._descriptors, des, k=params['match_k'])
+      matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * params['match_sim']]
+    if self._debug:
+      with self._timers['t_dbg']:
+        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, self._keypoints, pipeline[TRACKING_RESIZE], kp, matches)
+    if len(matches) < params['match_min']:
+      pipeline[TRACKING_FINAL] = None
+      return self._StoreTrackingResult(pipeline)
+    with self._timers['t_homography']:
+      src_pts = np.float32([self._keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+      dst_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2) / factor
+      M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, params['ransac_th'])
+    with self._timers['t_warp']:
+      pipeline[TRACKING_FINAL] = cv2.warpPerspective(
+          pipeline[TRACKING_GRAY], cv2.invert(M)[1], pattern.shape)
+    if self._debug:
+      with self._timers['t_dbg']:
+        h, w = pattern.shape
+        pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+        dst = cv2.perspectiveTransform(pts, M)
+        cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
+    return self._StoreTrackingResult(pipeline)
 
 
 def _BuildGridImage(size):
@@ -332,7 +325,7 @@ def _DrawMatches(img1, kp1, img2, kp2, matches):
   cols1 = img1.shape[1]
   rows2 = img2.shape[0]
   cols2 = img2.shape[1]
-  out = np.ones((max([rows1, rows2]), cols1 + cols2, 3), dtype='uint8') * 255
+  out = np.ones((max([rows1, rows2]), cols1 + cols2, 3), dtype='uint8') * 200
   out[:rows1, :cols1] = np.dstack([img1, img1, img1])
   out[:rows2, cols1:] = np.dstack([img2, img2, img2])
   for mat in matches:

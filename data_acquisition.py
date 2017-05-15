@@ -29,6 +29,7 @@ _CROP_SIZE = 24  # Divisible by 8.
 _BLUR = 1
 _LARGEST_BOARDSIZE = 19
 
+_LAYOUT_PARAM_OFFSET = 360
 _LAYOUT_PARAM_HEIGHT = 20
 _LAYOUT_LABEL_WIDTH = 100
 _LAYOUT_MARGIN = 5
@@ -65,7 +66,7 @@ class MainWindow(QDialog):
     self._vision = vision.Vision(debug=True)
 
     # Sliders.
-    self._param_offset = 360
+    self._param_offset = _LAYOUT_PARAM_OFFSET
     self._params = {}
     self._params_lock = threading.Lock()
     # These parameters are the same as the ones in vision.Vision.
@@ -76,7 +77,7 @@ class MainWindow(QDialog):
     self.AddParameter('ctr_size', min_value=10, max_value=300, step_size=10, default_value=200, step=vision.CALIBRATION_CONTOUR)
     self.AddParameter('approx', min_value=0, max_value=1, step_size=0.01, default_value=0.01, step=vision.CALIBRATION_CONTOUR)
     self.AddParameter('vote', min_value=20, max_value=200, step_size=10, default_value=50, step=vision.CALIBRATION_VOTE)
-    self.AddParameter('match_k', min_value=1, max_value=5, step_size=1, default_value=2, step=vision.TRACKING_ORIGINAL)
+    self.AddParameter('match_k', min_value=1, max_value=5, step_size=1, default_value=2, step=vision.TRACKING_MATCHES)
     self.AddParameter('match_sim', min_value=.5, max_value=1., step_size=.05, default_value=.75, step=vision.TRACKING_MATCHES)
     self.AddParameter('match_min', min_value=0, max_value=100, step_size=10, default_value=30, step=vision.TRACKING_MATCHES)
     self.AddParameter('ransac_th', min_value=1, max_value=10, step_size=1, default_value=5, step=vision.TRACKING_MATCHES)
@@ -105,7 +106,7 @@ class MainWindow(QDialog):
     # Timing information.
     self._timings_label = QLabel('', self)
     self._timings_label.move(_LAYOUT_MARGIN, _LAYOUT_MARGIN)
-    self._timings_label.setFixedSize(_ORIGNAL_WIDTH - 2 * _LAYOUT_MARGIN, _ORIGNAL_WIDTH - 2 * _LAYOUT_MARGIN)
+    self._timings_label.setFixedSize(_ORIGNAL_WIDTH - 2 * _LAYOUT_MARGIN, _LAYOUT_PARAM_OFFSET - 2 * _LAYOUT_MARGIN - _LAYOUT_PARAM_HEIGHT)
     self._timings_label.setStyleSheet('color: green')
     self._timings_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
 
