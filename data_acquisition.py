@@ -252,11 +252,10 @@ class MainWindow(QDialog):
   def ConvertToQImage(self, img, width=None, height=None):
     img = util.ResizeImage(img, width, height)
     if len(img.shape) == 2:
-      height, width = img.shape
-      num_bytes = 1
-      return QImage(img, width, height, num_bytes * width, QImage.Format_Indexed8)
+      img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    else:
+      img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     height, width, num_bytes = img.shape
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return QImage(img, width, height, num_bytes * width, QImage.Format_RGB888)
 
   def Process(self):
@@ -302,6 +301,7 @@ class MainWindow(QDialog):
         painter.drawImage(0, 0, self._display_image_left)
       if self._display_image_right is not None:
         painter.drawImage(480, 0, self._display_image_right)
+        # painter.drawImage(480, 0, self._display_image_left)
     painter.end()
 
   def Quit(self):
@@ -340,17 +340,17 @@ class MainWindow(QDialog):
             self._display_groundtruth = show_groundtruth
           self.UpdateGroundtruthButtons()
     elif 'd' == QKeyEvent.text():
-        with self._display_image_lock:
-          with self._display_groundtruth_lock:
-            if self._display_groundtruth:
-              print 'Detecting stones...'
-              img = cv2.GaussianBlur(self._processed_image, (_BLUR, _BLUR), 0)
-              with self._groundtruth_lock:
-                for i in range(self._boardsize):
-                  for j in range(self._boardsize):
-                    self._groundtruth[i, j] = self.Detect(img, i, j)
-            print 'Done'
-          self.UpdateGroundtruthButtons()
+      with self._display_image_lock:
+        with self._display_groundtruth_lock:
+          if self._display_groundtruth:
+            print 'Detecting stones...'
+            img = cv2.GaussianBlur(self._processed_image, (_BLUR, _BLUR), 0)
+            with self._groundtruth_lock:
+              for i in range(self._boardsize):
+                for j in range(self._boardsize):
+                  self._groundtruth[i, j] = self.Detect(img, i, j)
+          print 'Done'
+        self.UpdateGroundtruthButtons()
     elif 'n' == QKeyEvent.text():
       print 'Getting next static image...'
       self._capture.Next()
