@@ -10,7 +10,7 @@ class Timer:
     return self
 
   def __exit__(self, *args):
-    dt = self._start - time.clock()
+    dt = time.clock() - self._start
     self._average_time = .9 * self._average_time + .1 * dt
 
   def GetMs(self):

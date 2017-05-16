@@ -3,6 +3,7 @@ import copy
 import cv2
 import numpy as np
 
+import nn
 import rw_lock
 import timer
 import util
@@ -78,14 +79,12 @@ class Vision(object):
     self._tracking_image = None
     self._keypoints = None
     self._descriptors = None
+    self._transform_matrix = None
     use_sift = False
     if use_sift:
       self._keypoint_detector = cv2.SIFT()
-      self._flann = cv2.FlannBasedMatcher({'algorithm': 0, 'trees': 5}, {'checks': 50})
     else:
       self._keypoint_detector = cv2.ORB()
-      self._flann = cv2.FlannBasedMatcher({'algorithm': 6, 'table_number': 6, 'key_size': 12,  'multi_probe_level': 1},
-                                          {'checks': 100})
     # Debugging mode keeps track of all intermediate processing steps.
     self._debug = debug
     self._debug_calibration_pipeline = {}
@@ -107,7 +106,7 @@ class Vision(object):
   def _CopyTimingsMs(self):
     return sorted((k, t.GetMs()) for k, t in self._timers.iteritems())
 
-  def _StoreCalibrationResult(self, pipeline, boardsize=0):
+  def _StoreCalibrationResult(self, pipeline, boardsize=0, transform=None):
     if self._debug:
       self._debug_calibration_pipeline = pipeline
     if pipeline[CALIBRATION_FINAL] is None:
@@ -115,6 +114,7 @@ class Vision(object):
     # Only store a new calibration image if there is one.
     self._calibration_image = pipeline[CALIBRATION_FINAL]
     self._boardsize = boardsize
+    self._transform_matrix = transform
     self._keypoints, self._descriptors = self._keypoint_detector.detectAndCompute(self._calibration_image, None)
     return True
 
@@ -228,7 +228,7 @@ class Vision(object):
           if len(pipeline[step].shape) == 2:
             pipeline[step] = cv2.cvtColor(pipeline[step], cv2.COLOR_GRAY2BGR)
           cv2.drawContours(pipeline[step], [best_contour], -1, (0, 255, 0), 2)
-    return self._StoreCalibrationResult(pipeline, best_size)
+    return self._StoreCalibrationResult(pipeline, best_size, M)
 
   def _StoreTrackingResult(self, pipeline):
     if self._debug:
@@ -257,6 +257,13 @@ class Vision(object):
     pattern = self._calibration_image
     # Calibration was successful.
 
+    # DEBUG.
+    img = input_image.copy()
+    inverse_M = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+    print img.shape
+    input_image = cv2.warpPerspective(img, inverse_M, img.shape[:2][::-1])
+    print input_image.shape
+
     # Keep track of all images. In debug mode, these images are
     # then copied atomically. Otherwise they are discarded.
     pipeline = {}
@@ -264,35 +271,49 @@ class Vision(object):
       pipeline[TRACKING_ORIGINAL] = util.ResizeImage(input_image, height=720)
     with self._timers['t_gray']:
       pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
-    with self._timers['t_resize_2']:
-      factor = 0.5
-      pipeline[TRACKING_RESIZE] = util.ResizeImage(pipeline[TRACKING_GRAY], height=int(pipeline[TRACKING_GRAY].shape[0] * factor))
 
-    # Taken from http://docs.opencv.org/3.0-beta/doc/py_tutorials/py_feature2d/py_feature_homography/py_feature_homography.html#py-feature-homography.
+    # We transform the new image with the previous transformation matrix.
+    M1 = self._transform_matrix
+    new_projection = cv2.warpPerspective(pipeline[TRACKING_GRAY], M1, pattern.shape)
+
+    # Compute keypoints.
     with self._timers['t_keypoints']:
-      kp, des = self._keypoint_detector.detectAndCompute(pipeline[TRACKING_RESIZE], None)
+      kp, des = self._keypoint_detector.detectAndCompute(new_projection, None)
+
     with self._timers['t_matches']:
-      matches = self._flann.knnMatch(self._descriptors, des, k=params['match_k'])
-      matches = [m[0] for m in matches if len(m) == 2 and m[0].distance < m[1].distance * params['match_sim']]
+      # TODO: initialize before.
+      searcher = nn.NearestNeighborSearcher(self._keypoints, self._descriptors, nn.EUCLIDEAN_DISTANCE)
+      matches = searcher.Search(kp, des, k=params['match_k'])
+      # Remove weak matches (take only the 50%).
+      num_matches = len(matches)
+      matches = [m[1] for m in sorted((m.descriptor_distance, m) for m in matches)[:num_matches // 2]]
+      # matches = sorted([m for m in matches if m.descriptor_distance < best_match * (1. + params['match_sim'])])
     if self._debug:
       with self._timers['t_dbg']:
-        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, self._keypoints, pipeline[TRACKING_RESIZE], kp, matches)
-    if len(matches) < params['match_min']:
-      pipeline[TRACKING_FINAL] = None
-      return self._StoreTrackingResult(pipeline)
+        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, new_projection, matches)
+
+    # Compute homography.
     with self._timers['t_homography']:
-      src_pts = np.float32([self._keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-      dst_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2) / factor
-      M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, params['ransac_th'])
+      print len(matches)
+      src_pts = np.float32([m.xy_database for m in matches]).reshape(-1, 1, 2)
+      dst_pts = np.float32([m.xy_query for m in matches]).reshape(-1, 1, 2)
+      M2, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, params['ransac_th'])
+      # Combine both transformations.
+      M = M2.dot(M1)
+
     with self._timers['t_warp']:
       pipeline[TRACKING_FINAL] = cv2.warpPerspective(
-          pipeline[TRACKING_GRAY], cv2.invert(M)[1], pattern.shape)
+          pipeline[TRACKING_GRAY], M, pattern.shape)
+
     if self._debug:
       with self._timers['t_dbg']:
         h, w = pattern.shape
         pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-        dst = cv2.perspectiveTransform(pts, M)
+        dst = cv2.perspectiveTransform(pts, cv2.invert(M)[1])
         cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
+
+    self._transform_matrix = M
+
     return self._StoreTrackingResult(pipeline)
 
 
@@ -320,7 +341,7 @@ def _OrderPoints(pts):
   return np.float32(pts[i, :])
 
 
-def _DrawMatches(img1, kp1, img2, kp2, matches):
+def _DrawMatches(img1, img2, matches):
   rows1 = img1.shape[0]
   cols1 = img1.shape[1]
   rows2 = img2.shape[0]
@@ -328,11 +349,9 @@ def _DrawMatches(img1, kp1, img2, kp2, matches):
   out = np.ones((max([rows1, rows2]), cols1 + cols2, 3), dtype='uint8') * 200
   out[:rows1, :cols1] = np.dstack([img1, img1, img1])
   out[:rows2, cols1:] = np.dstack([img2, img2, img2])
-  for mat in matches:
-    img1_idx = mat.queryIdx
-    img2_idx = mat.trainIdx
-    x1, y1 = kp1[img1_idx].pt
-    x2, y2 = kp2[img2_idx].pt
+  for m in matches:
+    x1, y1 = m.xy_database
+    x2, y2 = m.xy_query
     cv2.circle(out, (int(x1), int(y1)), 4, (255, 0, 0), 1)
     cv2.circle(out, (int(x2) + cols1, int(y2)), 4, (255, 0, 0), 1)
     cv2.line(out, (int(x1), int(y1)), (int(x2) + cols1, int(y2)), (255, 0, 0), 1)
