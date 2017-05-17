@@ -3,7 +3,7 @@ import scipy.spatial
 
 
 EUCLIDEAN_DISTANCE = 0
-HAMMING_DISTANCE   = 1
+HAMMING_DISTANCE = 1
 
 
 class Match(object):
@@ -25,7 +25,7 @@ class NearestNeighborSearcher(object):
     self._distance = (scipy.spatial.distance.euclidean if descriptor_distance == EUCLIDEAN_DISTANCE else
                       scipy.spatial.distance.hamming)
 
-  def Search(self, keypoints, descriptors, k=1):
+  def Search(self, keypoints, descriptors, k=1, r=1e-8):
     # Returns the closest descriptor in descriptor-space among the closest k neighbors in keypoint-space.
     matches = []
     distances, indices = self._kdtree.query([kp.pt for kp in keypoints], k=k)
@@ -33,7 +33,8 @@ class NearestNeighborSearcher(object):
       distances = distances.reshape(-1, 1)
       indices = indices.reshape(-1, 1)
     for i in range(len(keypoints)):
-      descriptor_distances = [self._distance(descriptors[i], self._descriptors[indices[i, j]]) for j in range(k)]
-      j = np.argmin(descriptor_distances)
-      matches.append(Match(self._keypoints[indices[i, j]], keypoints[i], distances[i, j], descriptor_distances[j]))
+      descriptor_distances = [self._distance(descriptors[i], self._descriptors[indices[i, j]]) for j in range(k) if distances[i, j] < r]
+      if descriptor_distances:
+        j = np.argmin(descriptor_distances)
+        matches.append(Match(self._keypoints[indices[i, j]], keypoints[i], distances[i, j], descriptor_distances[j]))
     return matches

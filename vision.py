@@ -80,7 +80,7 @@ class Vision(object):
     self._keypoints = None
     self._descriptors = None
     self._transform_matrix = None
-    use_sift = False
+    use_sift = True
     if use_sift:
       self._keypoint_detector = cv2.SIFT()
     else:
@@ -259,10 +259,8 @@ class Vision(object):
 
     # DEBUG.
     img = input_image.copy()
-    inverse_M = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
-    print img.shape
+    inverse_M = np.array([[1, 0.01, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
     input_image = cv2.warpPerspective(img, inverse_M, img.shape[:2][::-1])
-    print input_image.shape
 
     # Keep track of all images. In debug mode, these images are
     # then copied atomically. Otherwise they are discarded.
@@ -283,18 +281,13 @@ class Vision(object):
     with self._timers['t_matches']:
       # TODO: initialize before.
       searcher = nn.NearestNeighborSearcher(self._keypoints, self._descriptors, nn.EUCLIDEAN_DISTANCE)
-      matches = searcher.Search(kp, des, k=params['match_k'])
+      matches = searcher.Search(kp, des, k=params['match_k'], r=params['match_r'])
       # Remove weak matches (take only the 50%).
       num_matches = len(matches)
       matches = [m[1] for m in sorted((m.descriptor_distance, m) for m in matches)[:num_matches // 2]]
-      # matches = sorted([m for m in matches if m.descriptor_distance < best_match * (1. + params['match_sim'])])
-    if self._debug:
-      with self._timers['t_dbg']:
-        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, new_projection, matches)
 
     # Compute homography.
     with self._timers['t_homography']:
-      print len(matches)
       src_pts = np.float32([m.xy_database for m in matches]).reshape(-1, 1, 2)
       dst_pts = np.float32([m.xy_query for m in matches]).reshape(-1, 1, 2)
       M2, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, params['ransac_th'])
@@ -309,10 +302,16 @@ class Vision(object):
       with self._timers['t_dbg']:
         h, w = pattern.shape
         pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+
+        dst = cv2.perspectiveTransform(pts, cv2.invert(M2)[1])
+        cv2.polylines(new_projection, [np.int32(dst)], True, 255, 3)
+        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, new_projection, matches)
+
         dst = cv2.perspectiveTransform(pts, cv2.invert(M)[1])
         cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
 
-    self._transform_matrix = M
+    # TODO: Update tracking
+    # self._transform_matrix = M
 
     return self._StoreTrackingResult(pipeline)
 

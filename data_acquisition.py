@@ -78,8 +78,7 @@ class MainWindow(QDialog):
     self.AddParameter('approx', min_value=0, max_value=1, step_size=0.01, default_value=0.01, step=vision.CALIBRATION_CONTOUR)
     self.AddParameter('vote', min_value=20, max_value=200, step_size=10, default_value=50, step=vision.CALIBRATION_VOTE)
     self.AddParameter('match_k', min_value=1, max_value=5, step_size=1, default_value=2, step=vision.TRACKING_MATCHES)
-    self.AddParameter('match_sim', min_value=.1, max_value=1., step_size=.05, default_value=.3, step=vision.TRACKING_MATCHES)
-    self.AddParameter('match_min', min_value=0, max_value=100, step_size=10, default_value=30, step=vision.TRACKING_MATCHES)
+    self.AddParameter('match_r', min_value=4, max_value=100, step_size=2, default_value=10, step=vision.TRACKING_MATCHES)
     self.AddParameter('ransac_th', min_value=1, max_value=10, step_size=1, default_value=5, step=vision.TRACKING_MATCHES)
 
     # Buttons (these are invisible originally).
