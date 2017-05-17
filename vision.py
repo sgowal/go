@@ -80,7 +80,7 @@ class Vision(object):
     self._keypoints = None
     self._descriptors = None
     self._transform_matrix = None
-    use_sift = True
+    use_sift = False
     if use_sift:
       self._keypoint_detector = cv2.SIFT()
     else:
@@ -271,30 +271,23 @@ class Vision(object):
       pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
 
     # We transform the new image with the previous transformation matrix.
-    M1 = self._transform_matrix
-    new_projection = cv2.warpPerspective(pipeline[TRACKING_GRAY], M1, pattern.shape)
+    with self._timers['t_warp1']:
+      M1 = self._transform_matrix
+      new_projection = cv2.warpPerspective(pipeline[TRACKING_GRAY], M1, pattern.shape)
+      # TO TEST
+      # new_projection = util.ResizeImage(input_image, height=240)
 
-    # Compute keypoints.
-    with self._timers['t_keypoints']:
-      kp, des = self._keypoint_detector.detectAndCompute(new_projection, None)
-
-    with self._timers['t_matches']:
-      # TODO: initialize before.
-      searcher = nn.NearestNeighborSearcher(self._keypoints, self._descriptors, nn.EUCLIDEAN_DISTANCE)
-      matches = searcher.Search(kp, des, k=params['match_k'], r=params['match_r'])
-      # Remove weak matches (take only the 50%).
-      num_matches = len(matches)
-      matches = [m[1] for m in sorted((m.descriptor_distance, m) for m in matches)[:num_matches // 2]]
-
-    # Compute homography.
-    with self._timers['t_homography']:
-      src_pts = np.float32([m.xy_database for m in matches]).reshape(-1, 1, 2)
-      dst_pts = np.float32([m.xy_query for m in matches]).reshape(-1, 1, 2)
-      M2, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, params['ransac_th'])
+    with self._timers['t_ecc']:
+      warp_mode = cv2.MOTION_HOMOGRAPHY
+      warp_matrix = np.eye(3, 3, dtype=np.float32)
+      number_of_iterations = 5000
+      termination_eps = 1e-10
+      criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
+      _, M2 = cv2.findTransformECC(pattern, new_projection, warp_matrix, warp_mode, criteria)
       # Combine both transformations.
       M = M2.dot(M1)
 
-    with self._timers['t_warp']:
+    with self._timers['t_warp2']:
       pipeline[TRACKING_FINAL] = cv2.warpPerspective(
           pipeline[TRACKING_GRAY], M, pattern.shape)
 
