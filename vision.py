@@ -77,14 +77,7 @@ class Vision(object):
     self._calibration_image = None
     # Tracking.
     self._tracking_image = None
-    self._keypoints = None
-    self._descriptors = None
     self._transform_matrix = None
-    use_sift = False
-    if use_sift:
-      self._keypoint_detector = cv2.SIFT()
-    else:
-      self._keypoint_detector = cv2.ORB()
     # Debugging mode keeps track of all intermediate processing steps.
     self._debug = debug
     self._debug_calibration_pipeline = {}
@@ -115,7 +108,6 @@ class Vision(object):
     self._calibration_image = pipeline[CALIBRATION_FINAL]
     self._boardsize = boardsize
     self._transform_matrix = transform
-    self._keypoints, self._descriptors = self._keypoint_detector.detectAndCompute(self._calibration_image, None)
     return True
 
   def GetCalibrationResult(self, debug_step=CALIBRATION_ORIGINAL):
@@ -164,7 +156,7 @@ class Vision(object):
 
     # Find the largest contour.
     with self._timers['c_contour']:
-      contours, _ = cv2.findContours(output, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+      _, contours, _ = cv2.findContours(output, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
       max_area = 0
       all_valid_contours = []  # Used for debug only.
       best_contour = None
@@ -298,7 +290,7 @@ class Vision(object):
 
         dst = cv2.perspectiveTransform(pts, cv2.invert(M2)[1])
         cv2.polylines(new_projection, [np.int32(dst)], True, 255, 3)
-        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, new_projection, matches)
+        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, new_projection, [])
 
         dst = cv2.perspectiveTransform(pts, cv2.invert(M)[1])
         cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
