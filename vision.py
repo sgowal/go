@@ -34,7 +34,7 @@ ALL_UNPROJECTED_CALIBRATION_STEPS = set([
 TRACKING_ORIGINAL = 20
 TRACKING_GRAY = 21
 TRACKING_RESIZE = 22
-TRACKING_MATCHES = 23
+TRACKING_GRAY_REDUCED = 23
 TRACKING_FINAL = 24
 ALL_TRACKING_STEPS = set(range(20, 25))
 
@@ -46,6 +46,9 @@ _VOTE_SIZE = 200
 _VOTE_MARGIN = 5
 SQUARE_SIZE = 25
 MARGIN = 13
+
+# Reduced image sizes passed to ECC by this factor.
+_ECC_REDUCE = 4
 
 
 # This class is mostly NOT multi-threaded. Only the parameters can be changed atomically.
@@ -246,12 +249,14 @@ class Vision(object):
       params = copy.deepcopy(self._parameters)
 
     assert self._calibration_image is not None
-    pattern = self._calibration_image
+    pattern = util.ResizeImage(self._calibration_image, height=self._calibration_image.shape[0] // _ECC_REDUCE)
+    print pattern.shape
+
     # Calibration was successful.
 
     # DEBUG.
     img = input_image.copy()
-    inverse_M = np.array([[1, 0.01, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+    inverse_M = np.array([[1, 0.1, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
     input_image = cv2.warpPerspective(img, inverse_M, img.shape[:2][::-1])
 
     # Keep track of all images. In debug mode, these images are
@@ -261,39 +266,40 @@ class Vision(object):
       pipeline[TRACKING_ORIGINAL] = util.ResizeImage(input_image, height=720)
     with self._timers['t_gray']:
       pipeline[TRACKING_GRAY] = cv2.cvtColor(pipeline[TRACKING_ORIGINAL], cv2.COLOR_BGR2GRAY)
+      pipeline[TRACKING_GRAY_REDUCED] = util.ResizeImage(pipeline[TRACKING_GRAY], height=pipeline[TRACKING_GRAY].shape[0] // _ECC_REDUCE)
+    print pipeline[TRACKING_GRAY_REDUCED].shape
 
-    # We transform the new image with the previous transformation matrix.
-    with self._timers['t_warp1']:
-      M1 = self._transform_matrix
-      new_projection = cv2.warpPerspective(pipeline[TRACKING_GRAY], M1, pattern.shape)
-      # TO TEST
-      # new_projection = util.ResizeImage(input_image, height=240)
-
+    # We perform ECC matching, but providing the warp_matrix that transforms
+    # reduced pattern into our reduced gray image.
     with self._timers['t_ecc']:
       warp_mode = cv2.MOTION_HOMOGRAPHY
-      warp_matrix = np.eye(3, 3, dtype=np.float32)
-      number_of_iterations = 5000
-      termination_eps = 1e-10
+      S1 = np.eye(3, 3, dtype=np.float32)
+      S1[0, 0] = float(_ECC_REDUCE)
+      S1[1, 1] = float(_ECC_REDUCE)
+      S2 = S1.copy()
+      S2[np.diag_indices_from(S2)] = 1./ S2[np.diag_indices_from(S2)]
+      M1 = S2.dot(self._transform_matrix).dot(S1)
+      warp_matrix = cv2.invert(M1)[1].astype(np.float32)
+      number_of_iterations = 100
+      termination_eps = 1e-3
       criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
-      _, M2 = cv2.findTransformECC(pattern, new_projection, warp_matrix, warp_mode, criteria)
-      # Combine both transformations.
-      M = M2.dot(M1)
+      cc, M2 = cv2.findTransformECC(pattern, pipeline[TRACKING_GRAY_REDUCED], warp_matrix, warp_mode, criteria)
+      M = S1.dot(cv2.invert(M2)[1]).dot(S2)
+      print cc
 
     with self._timers['t_warp2']:
       pipeline[TRACKING_FINAL] = cv2.warpPerspective(
-          pipeline[TRACKING_GRAY], M, pattern.shape)
+          pipeline[TRACKING_GRAY], M, self._calibration_image.shape)
 
     if self._debug:
       with self._timers['t_dbg']:
-        h, w = pattern.shape
+        h, w = self._calibration_image.shape
         pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
 
-        dst = cv2.perspectiveTransform(pts, cv2.invert(M2)[1])
-        cv2.polylines(new_projection, [np.int32(dst)], True, 255, 3)
-        pipeline[TRACKING_MATCHES] = _DrawMatches(pattern, new_projection, [])
-
         dst = cv2.perspectiveTransform(pts, cv2.invert(M)[1])
-        cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, 255, 3)
+        cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, (255, 0, 0), 3)
+        dst = cv2.perspectiveTransform(pts, cv2.invert(self._transform_matrix)[1])
+        cv2.polylines(pipeline[TRACKING_ORIGINAL], [np.int32(dst)], True, (255, 255, 255), 1)
 
     # TODO: Update tracking
     # self._transform_matrix = M
