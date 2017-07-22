@@ -283,9 +283,14 @@ class Vision(object):
       number_of_iterations = 100
       termination_eps = 1e-3
       criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
-      cc, M2 = cv2.findTransformECC(pattern, pipeline[TRACKING_GRAY_REDUCED], warp_matrix, warp_mode, criteria)
-      M = S1.dot(cv2.invert(M2)[1]).dot(S2)
-      print cc
+      try:
+        cc, M2 = cv2.findTransformECC(pattern, pipeline[TRACKING_GRAY_REDUCED], warp_matrix, warp_mode, criteria)
+        M = S1.dot(cv2.invert(M2)[1]).dot(S2)
+        print cc
+      except Exception:
+        print 'Cannot track'
+        pipeline[TRACKING_FINAL] = None
+        return self._StoreTrackingResult(pipeline)
 
     with self._timers['t_warp2']:
       pipeline[TRACKING_FINAL] = cv2.warpPerspective(
